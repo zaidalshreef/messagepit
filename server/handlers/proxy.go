@@ -2,7 +2,6 @@
 package handlers
 
 import (
-	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
@@ -21,6 +20,7 @@ import (
 	"github.com/coreydaley/messagepit/internal/logger"
 	"github.com/coreydaley/messagepit/internal/storage"
 	"github.com/coreydaley/messagepit/internal/tools"
+	"github.com/coreydaley/messagepit/internal/transport"
 )
 
 const (
@@ -57,7 +57,7 @@ func init() {
 			now := time.Now()
 			for id, entry := range assets {
 				if now.Sub(entry.Created) > time.Minute {
-					logger.Log().Debugf("[proxy] cleaning up assets for message %s", id)
+					logger.Log().Debug("[proxy] cleaning up expired assets")
 					delete(assets, id)
 				}
 			}
@@ -78,14 +78,14 @@ func ProxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	decoded, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
-		logger.Log().Warnf("[proxy] Data parameter corrupted: %s", err.Error())
+		logger.Log().Warn("[proxy] Data parameter corrupted")
 		httpError(w, "Error: invalid request")
 		return
 	}
 
 	parts := strings.SplitN(string(decoded), ":", 2)
 	if len(parts) != 2 {
-		logger.Log().Warnf("[proxy] Invalid data parameter: %s", string(decoded))
+		logger.Log().Warn("[proxy] Invalid data parameter")
 		httpError(w, "Error: invalid request")
 		return
 	}
@@ -100,13 +100,13 @@ func ProxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !tools.InArray(uri, links) {
-		logger.Log().Warnf("[proxy] URL %s not found in message %s", uri, id)
+		logger.Log().Warn("[proxy] URL not found in message")
 		httpError(w, "Error: invalid request")
 		return
 	}
 
 	if !linkRe.MatchString(uri) || !tools.IsValidLinkURL(uri) {
-		logger.Log().Warnf("[proxy] invalid URL %s", uri)
+		logger.Log().Warn("[proxy] invalid URL")
 		httpError(w, "Error: invalid URL")
 		return
 	}
@@ -117,7 +117,7 @@ func ProxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tr := &http.Transport{
-		DialContext: safeDialContext(dialer),
+		DialContext: transport.InspectionDialContext(dialer, config.AllowInternalHTTPRequests),
 	}
 
 	if config.AllowUntrustedTLS {
@@ -132,7 +132,7 @@ func ProxyHandler(w http.ResponseWriter, r *http.Request) {
 				return errors.New("too many redirects")
 			}
 			if !tools.IsValidLinkURL(req.URL.String()) {
-				return fmt.Errorf("blocked redirect to invalid URL: %s", req.URL)
+				return errors.New("blocked redirect to invalid URL")
 			}
 			return nil
 		},
@@ -140,7 +140,7 @@ func ProxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	req, err := http.NewRequest("GET", uri, nil)
 	if err != nil {
-		logger.Log().Warnf("[proxy] %s", err.Error())
+		logger.Log().Warn("[proxy] could not construct request")
 		httpError(w, "Error: invalid request")
 		return
 	}
@@ -150,7 +150,7 @@ func ProxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		logger.Log().Warnf("[proxy] %s", err.Error())
+		logger.Log().Warnf("[proxy] %s", logger.HTTPErrorSummary(err))
 		httpError(w, "Error: invalid request")
 		return
 	}
@@ -158,14 +158,14 @@ func ProxyHandler(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		logger.Log().Warnf("[proxy] received status code %d for %s", resp.StatusCode, uri)
+		logger.Log().Warnf("[proxy] received status code %d", resp.StatusCode)
 		httpError(w, "Error: invalid request")
 		return
 	}
 
 	ct := strings.ToLower(resp.Header.Get("content-type"))
 	if !supportedProxyContentType(ct) {
-		logger.Log().Warnf("[proxy] blocking unsupported content-type %s for %s", ct, uri)
+		logger.Log().Warn("[proxy] blocking unsupported content type")
 		httpError(w, "Error: invalid request")
 		return
 	}
@@ -173,12 +173,12 @@ func ProxyHandler(w http.ResponseWriter, r *http.Request) {
 	limitedBody := io.LimitReader(resp.Body, maxProxyBodySize+1)
 	body, err := io.ReadAll(limitedBody)
 	if err != nil {
-		logger.Log().Warnf("[proxy] %s", err.Error())
+		logger.Log().Warn("[proxy] failed to read response")
 		httpError(w, "Error: invalid request")
 		return
 	}
 	if int64(len(body)) > maxProxyBodySize {
-		logger.Log().Warnf("[proxy] response body for %s exceeds %d bytes, blocking", uri, maxProxyBodySize)
+		logger.Log().Warnf("[proxy] response body exceeds %d bytes, blocking", maxProxyBodySize)
 		httpError(w, "Error: response too large")
 		return
 	}
@@ -208,19 +208,19 @@ func ProxyHandler(w http.ResponseWriter, r *http.Request) {
 
 			address, err := absoluteURL(parts[3], uri)
 			if err != nil {
-				logger.Log().Errorf("[proxy] %s", err.Error())
+				logger.Log().Error("[proxy] could not resolve CSS asset URL")
 				return []byte(parts[3])
 			}
 
 			// store asset address against message ID
+			assetsMutex.Lock()
 			if result, ok := assets[id]; ok {
 				if !tools.InArray(address, result.Assets) {
-					assetsMutex.Lock()
 					result.Assets = append(result.Assets, address)
 					assets[id] = result
-					assetsMutex.Unlock()
 				}
 			}
+			assetsMutex.Unlock()
 
 			// encode with base64 to handle any special characters and group message ID with URL
 			encoded := base64.StdEncoding.EncodeToString([]byte(id + ":" + address))
@@ -229,13 +229,13 @@ func ProxyHandler(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	logger.Log().Debugf("[proxy] %s (%d)", uri, resp.StatusCode)
+	logger.Log().Debugf("[proxy] request completed (%d)", resp.StatusCode)
 
 	// relay status code - WriteHeader must come after Header.Set()
 	w.WriteHeader(resp.StatusCode)
 
 	if _, err := w.Write(body); err != nil {
-		logger.Log().Warnf("[proxy] %s", err.Error())
+		logger.Log().Warn("[proxy] failed to write response")
 	}
 }
 
@@ -248,7 +248,7 @@ func getAssets(id string) ([]string, error) {
 	result, ok := assets[id]
 	if ok {
 		// return cached assets
-		return result.Assets, nil
+		return append([]string(nil), result.Assets...), nil
 	}
 
 	msg, err := storage.GetMessage(id)
@@ -310,7 +310,7 @@ func getAssets(id string) ([]string, error) {
 	r.Assets = links
 	assets[id] = r
 
-	return links, nil
+	return append([]string(nil), links...), nil
 }
 
 // AbsoluteURL will return a full URL regardless whether it is relative or absolute.
@@ -387,29 +387,4 @@ func supportedProxyContentType(ct string) bool {
 	}
 
 	return false
-}
-
-// SafeDialContext is a custom dialer that checks if the resolved IP addresses are internal before allowing the connection.
-func safeDialContext(dialer *net.Dialer) func(ctx context.Context, network, address string) (net.Conn, error) {
-	return func(ctx context.Context, network, address string) (net.Conn, error) {
-		host, port, err := net.SplitHostPort(address)
-		if err != nil {
-			return nil, err
-		}
-
-		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-		if err != nil {
-			return nil, err
-		}
-
-		if !config.AllowInternalHTTPRequests {
-			for _, ip := range ips {
-				if tools.IsInternalIP(ip.IP) {
-					return nil, fmt.Errorf("blocked request to %s (%s): private/reserved address", host, ip)
-				}
-			}
-		}
-
-		return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
-	}
 }

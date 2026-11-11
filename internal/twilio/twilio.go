@@ -4,6 +4,7 @@ package twilio
 import (
 	"crypto/hmac"
 	"crypto/sha1" // #nosec G505 -- Twilio's API uses SHA1; we have no choice
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,8 @@ import (
 
 	"github.com/coreydaley/messagepit/config"
 	"github.com/coreydaley/messagepit/internal/logger"
+	"github.com/coreydaley/messagepit/internal/qa"
+	"github.com/coreydaley/messagepit/internal/serviceauth"
 	"github.com/coreydaley/messagepit/internal/storage"
 	"github.com/gorilla/mux"
 )
@@ -49,6 +52,20 @@ type twilioMessageResponse struct {
 func CreateMessage(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	accountSID := vars["AccountSid"]
+	environmentID := ""
+	if config.SharedAuthEnabled() {
+		token, err := serviceauth.Basic(r, accountSID)
+		if err != nil {
+			httpError(w, http.StatusUnauthorized, "invalid service credential")
+			return
+		}
+		environmentID = token.EnvironmentID
+		if !storage.ValidCorrelationID(r.Header.Get(storage.CorrelationHeader)) {
+			httpError(w, http.StatusBadRequest, "invalid correlation ID")
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	}
 
 	if err := r.ParseForm(); err != nil {
 		httpError(w, http.StatusBadRequest, "invalid form data")
@@ -57,9 +74,9 @@ func CreateMessage(w http.ResponseWriter, r *http.Request) {
 
 	// Validate using HTTP Basic Auth (username=AccountSID, password=AuthToken) —
 	// the pattern the Twilio Messages API uses for outbound sends.
-	if config.TwilioAuthToken != "" {
+	if environmentID == "" && config.TwilioAuthToken != "" {
 		_, password, ok := r.BasicAuth()
-		if !ok || password != config.TwilioAuthToken {
+		if !ok || subtle.ConstantTimeCompare([]byte(password), []byte(config.TwilioAuthToken)) != 1 {
 			logger.Log().Warnf("[twilio] invalid credentials from %s", r.RemoteAddr)
 			httpError(w, http.StatusForbidden, "invalid credentials")
 			return
@@ -83,7 +100,13 @@ func CreateMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id, err := storage.StoreSMS(from, to, body, accountSID)
+	var id string
+	var err error
+	if environmentID != "" {
+		id, err = storage.StoreSMSInEnvironment(r.Context(), environmentID, from, to, body, accountSID, r.Header.Get(storage.CorrelationHeader))
+	} else {
+		id, err = storage.StoreSMS(from, to, body, accountSID)
+	}
 	if err != nil {
 		logger.Log().Errorf("[twilio] failed to store SMS: %s", err.Error())
 		httpError(w, http.StatusInternalServerError, "failed to store message")
@@ -92,11 +115,13 @@ func CreateMessage(w http.ResponseWriter, r *http.Request) {
 
 	// Prefer the per-request StatusCallback URL (mirrors real Twilio behaviour),
 	// fall back to the globally configured MP_TWILIO_WEBHOOK_URL.
-	callbackURL := strings.TrimSpace(r.FormValue("StatusCallback"))
-	if callbackURL == "" {
-		callbackURL = config.TwilioWebhookURL
+	if environmentID == "" {
+		callbackURL := strings.TrimSpace(r.FormValue("StatusCallback"))
+		if callbackURL == "" {
+			callbackURL = config.TwilioWebhookURL
+		}
+		fireSMSCallback(id, accountSID, to, from, callbackURL)
 	}
-	fireSMSCallback(id, accountSID, to, from, callbackURL)
 
 	now := time.Now().UTC().Format(time.RFC1123Z)
 	resp := twilioMessageResponse{
@@ -229,6 +254,16 @@ func progressionFor(to string) []statusStep {
 	return deliveredProgression
 }
 
+// SimulatedProgression returns the configured test sequence for a destination.
+func SimulatedProgression(to string) []qa.DeliveryStep {
+	steps := progressionFor(to)
+	result := make([]qa.DeliveryStep, 0, len(steps))
+	for _, step := range steps {
+		result = append(result, qa.DeliveryStep{Status: step.Status, ErrorCode: step.ErrorCode, ErrorMessage: step.ErrorMsg})
+	}
+	return result
+}
+
 // validSignature validates the X-Twilio-Signature header against the request.
 // See https://www.twilio.com/docs/usage/webhooks/webhooks-security
 func validSignature(r *http.Request, authToken string) bool {
@@ -309,7 +344,7 @@ func postStatusCallback(sid, accountSID, to, from, callbackURL string, step stat
 
 	req, err := http.NewRequest("POST", callbackURL, strings.NewReader(params.Encode()))
 	if err != nil {
-		logger.Log().Errorf("[twilio-callback] failed to build request: %s", err)
+		logger.Log().Error("[twilio-callback] invalid callback URL")
 		return
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -321,13 +356,13 @@ func postStatusCallback(sid, accountSID, to, from, callbackURL string, step stat
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		logger.Log().Errorf("[twilio-callback] error: %s", err)
+		logger.Log().Errorf("[twilio-callback] %s", logger.HTTPErrorSummary(err))
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		logger.Log().Warnf("[twilio-callback] %s returned %d for status %q", callbackURL, resp.StatusCode, step.Status)
+		logger.Log().Warnf("[twilio-callback] endpoint returned %d for status %q", resp.StatusCode, step.Status)
 	} else {
 		logger.Log().Debugf("[twilio-callback] %s status sent for %s", step.Status, sid)
 	}

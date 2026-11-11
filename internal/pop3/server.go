@@ -144,7 +144,9 @@ func handleClient(conn net.Conn) {
 		cmd, args := getCommand(rawLine)
 		cmd = strings.ToUpper(cmd) // Commands in the POP3 are case-insensitive
 
-		logger.Log().Debugf("[pop3] received: %s (%s)", strings.TrimSpace(rawLine), conn.RemoteAddr().String())
+		// Never log command arguments: PASS and unsupported authentication
+		// commands can carry credentials, including on malformed requests.
+		logger.Log().Debugf("[pop3] received: %s (%s)", safeCommandName(cmd), conn.RemoteAddr().String())
 
 		switch cmd {
 		case "CAPA":
@@ -188,7 +190,7 @@ func handleClient(conn net.Conn) {
 					state = TRANSACTION
 				} else {
 					sendResponse(conn, "-ERR invalid password")
-					logger.Log().Warnf("[pop3] failed login: %s", user)
+					logger.Log().Warnf("[pop3] failed login from %s", conn.RemoteAddr().String())
 				}
 			} else {
 				sendResponse(conn, "-ERR user not specified")

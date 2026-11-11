@@ -148,6 +148,28 @@ func TestCreateMessageWithInvalidSignature(t *testing.T) {
 	}
 }
 
+func TestCreateMessageRejectsPartialOrExtendedAuthToken(t *testing.T) {
+	setup()
+	defer storage.Close()
+	const token = "twilio-test-token"
+	config.TwilioAuthToken = token
+	defer func() { config.TwilioAuthToken = "" }()
+	form := url.Values{"From": {"+15550001111"}, "To": {"+15552223333"}, "Body": {"test message"}}
+	for _, candidate := range []string{token[:len(token)-1], token + "x", "twilio-test-tokem"} {
+		response := makeRequest(t, "ACtest", form, candidate)
+		if response.Code != http.StatusForbidden {
+			t.Fatalf("incorrect credential returned %d, want 403", response.Code)
+		}
+	}
+	stats, err := storage.GetSMSMailboxStats()
+	if err != nil || stats.Total != 0 {
+		t.Fatalf("incorrect credentials created SMS messages: %+v %v", stats, err)
+	}
+	if response := makeRequest(t, "ACtest", form, token); response.Code != http.StatusCreated {
+		t.Fatalf("valid credential returned %d, want 201", response.Code)
+	}
+}
+
 func TestCreateMessageNoSignatureWhenTokenRequired(t *testing.T) {
 	setup()
 	defer storage.Close()

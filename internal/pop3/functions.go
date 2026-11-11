@@ -67,6 +67,17 @@ func getTop(id string, nr int) (string, string, error) {
 	return header, strings.Join(lines, "\r\n"), nil
 }
 
+// safeCommandName returns only known command names, never client-supplied
+// arguments or malformed command text that could contain a credential.
+func safeCommandName(cmd string) string {
+	switch cmd {
+	case "CAPA", "USER", "PASS", "AUTH", "APOP", "STLS", "STAT", "LIST", "UIDL", "RETR", "TOP", "NOOP", "DELE", "RSET", "QUIT":
+		return cmd
+	default:
+		return "<unknown>"
+	}
+}
+
 // cuts the line into command and arguments
 func getCommand(line string) (string, []string) {
 	line = strings.Trim(line, "\r \n")

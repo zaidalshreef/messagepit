@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/mail"
 	"strings"
 	"testing"
 
@@ -132,7 +133,6 @@ func TestFormatAddress_EmailOnly(t *testing.T) {
 }
 
 // TestFormatAddress_NameUsesQEncoding verifies that a name produces a formatted address.
-// mime.QEncoding.Encode only wraps in encoded-word format for non-ASCII; ASCII names are used verbatim.
 func TestFormatAddress_NameUsesQEncoding(t *testing.T) {
 	result, err := mailadapter.FormatAddress("user@example.com", "Alice")
 	if err != nil {
@@ -209,5 +209,21 @@ func TestJSONError_WritesStatusContentTypeAndBody(t *testing.T) {
 	}
 	if body["error"] != "something went wrong" {
 		t.Errorf("expected error 'something went wrong', got %v", body["error"])
+	}
+}
+
+func TestFormatAddressSafelyEncodesDisplayName(t *testing.T) {
+	for _, name := range []string{"Doe, Jane", "QA: Team", "Eve\r\nBcc: hidden@example.test"} {
+		formatted, err := mailadapter.FormatAddress("user@example.com", name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.ContainsAny(formatted, "\r\n") {
+			t.Fatal("display name inserted a raw line break")
+		}
+		address, err := mail.ParseAddress(formatted)
+		if err != nil || address.Address != "user@example.com" || address.Name != name {
+			t.Fatalf("display name was not preserved safely: %+v %v", address, err)
+		}
 	}
 }

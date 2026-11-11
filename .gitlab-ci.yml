@@ -1,0 +1,64 @@
+stages:
+  - verify
+  - build
+
+frontend:
+  stage: verify
+  image: node:24-bookworm
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - .npm/
+  script:
+    - npm ci --cache .npm --prefer-offline
+    - npm run lint
+    - npm run package
+  artifacts:
+    paths:
+      - server/ui/dist/
+    expire_in: 1 day
+
+go-tests:
+  stage: build
+  image: golang:1.25.14
+  needs:
+    - job: frontend
+      artifacts: true
+  variables:
+    GOTOOLCHAIN: local
+    GOCACHE: $CI_PROJECT_DIR/.cache/go-build
+    GOMODCACHE: $CI_PROJECT_DIR/.cache/go-mod
+  cache:
+    key:
+      files:
+        - go.sum
+    paths:
+      - .cache/go-build/
+      - .cache/go-mod/
+  script:
+    - apt-get update -qq && apt-get install -y --no-install-recommends curl jq shellcheck
+    - test -z "$(gofmt -s -l $(git ls-files '*.go'))"
+    - go test ./...
+    - go vet ./...
+    - bash -n scripts/assert-captures.sh scripts/dev-sso.sh
+    - shellcheck scripts/assert-captures.sh scripts/dev-sso.sh
+    - go test ./internal/storage -run '^$' -bench BenchmarkScopedEmailCapture -benchtime=20x
+
+binary:
+  stage: build
+  image: golang:1.25.14
+  needs:
+    - job: frontend
+      artifacts: true
+  variables:
+    GOTOOLCHAIN: local
+    CGO_ENABLED: "0"
+  script:
+    - mkdir -p build
+    - go build -trimpath -o build/messagepit .
+  artifacts:
+    paths:
+      - build/messagepit
+    expire_in: 7 days

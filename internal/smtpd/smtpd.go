@@ -244,20 +244,21 @@ func (srv *Server) Serve(ln net.Listener) error {
 }
 
 type session struct {
-	srv           *Server
-	conn          net.Conn
-	br            *bufio.Reader
-	bw            *bufio.Writer
-	remoteIP      string // Remote IP address
-	remoteHost    string // Remote hostname according to reverse DNS lookup
-	remoteName    string // Remote hostname as supplied with EHLO
-	xClient       string // Information string as supplied with XCLIENT
-	xClientADDR   string // Information string as supplied with XCLIENT ADDR
-	xClientNAME   string // Information string as supplied with XCLIENT NAME
-	xClientTrust  bool   // Trust XCLIENT from current IP address
-	tls           bool
-	authenticated bool
-	username      *string // username, nil if not authenticated
+	srv            *Server
+	conn           net.Conn
+	br             *bufio.Reader
+	bw             *bufio.Writer
+	remoteIP       string // Remote IP address
+	remoteHost     string // Remote hostname according to reverse DNS lookup
+	remoteName     string // Remote hostname as supplied with EHLO
+	xClient        string // Information string as supplied with XCLIENT
+	xClientADDR    string // Information string as supplied with XCLIENT ADDR
+	xClientNAME    string // Information string as supplied with XCLIENT NAME
+	xClientTrust   bool   // Trust XCLIENT from current IP address
+	tls            bool
+	authenticated  bool
+	authInProgress bool
+	username       *string // username, nil if not authenticated
 }
 
 // Create new session from connection.
@@ -754,6 +755,7 @@ loop:
 			// RFC 4954 also specifies that ESMTP code 5.5.4 ("Invalid command arguments") should be returned
 			// when attempting to use an unsupported authentication type.
 			// Many servers return 5.7.4 ("Security features not supported") instead.
+			s.authInProgress = true
 			switch authType {
 			case "PLAIN":
 				s.authenticated, err = s.handleAuthPlain(authArgs)
@@ -762,6 +764,7 @@ loop:
 			case "CRAM-MD5":
 				s.authenticated, err = s.handleAuthCramMD5()
 			}
+			s.authInProgress = false
 
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
@@ -819,10 +822,24 @@ func (s *session) readLine() (string, error) {
 
 	if Debug {
 		verb := "READ"
-		if s.srv.LogRead != nil {
-			s.srv.LogRead(s.remoteIP, verb, line)
+		loggedLine := line
+		// Redact authentication payloads even when an invalid separator makes
+		// the command unrecognizable to the SMTP parser.
+		if s.authInProgress || (len(line) >= 4 && strings.EqualFold(line[:4], "AUTH")) {
+			loggedLine = "[authentication data redacted]"
 		} else {
-			log.Println(s.remoteIP, verb, line)
+			verb, _ := s.parseLine(line)
+			switch verb {
+			case "HELO", "EHLO", "MAIL", "RCPT", "DATA", "QUIT", "RSET", "NOOP", "XCLIENT", "HELP", "VRFY", "EXPN", "STARTTLS":
+			default:
+				// Unknown commands can themselves be malformed credentials.
+				loggedLine = "[unrecognized command redacted]"
+			}
+		}
+		if s.srv.LogRead != nil {
+			s.srv.LogRead(s.remoteIP, verb, loggedLine)
+		} else {
+			log.Println(s.remoteIP, verb, loggedLine)
 		}
 	}
 
@@ -844,33 +861,37 @@ func (s *session) parseLine(line string) (verb string, args string) {
 // Read the message data following a DATA command.
 func (s *session) readData() ([]byte, error) {
 	var data []byte
+	lineStart := true
+	tooLarge := false
 	for {
 		if s.srv.Timeout > 0 {
 			_ = s.conn.SetReadDeadline(time.Now().Add(s.srv.Timeout))
 		}
 
-		line, err := s.br.ReadBytes('\n')
-		if err != nil {
+		line, err := s.br.ReadSlice('\n')
+		if err != nil && err != bufio.ErrBufferFull {
 			return nil, err
 		}
 		// Handle end of data denoted by lone period (\r\n.\r\n)
-		if bytes.Equal(line, []byte(".\r\n")) {
+		if lineStart && err == nil && bytes.Equal(line, []byte(".\r\n")) {
+			if tooLarge {
+				return nil, maxSizeExceeded(s.srv.MaxSize)
+			}
 			break
 		}
 		// Remove leading period (RFC 5321 section 4.5.2)
-		if line[0] == '.' {
+		if lineStart && len(line) > 0 && line[0] == '.' {
 			line = line[1:]
 		}
 
-		// Enforce the maximum message size limit.
-		if s.srv.MaxSize > 0 {
-			if len(data)+len(line) > s.srv.MaxSize {
-				_, _ = s.br.Discard(s.br.Buffered()) // Discard the buffer remnants.
-				return nil, maxSizeExceeded(s.srv.MaxSize)
-			}
+		// Drain oversized DATA without buffering it so the session remains usable.
+		if s.srv.MaxSize > 0 && len(data)+len(line) > s.srv.MaxSize {
+			tooLarge = true
 		}
-
-		data = append(data, line...)
+		if !tooLarge {
+			data = append(data, line...)
+		}
+		lineStart = err == nil
 	}
 	return data, nil
 }

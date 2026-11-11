@@ -24,6 +24,7 @@ const ctx = await esbuild.context({
 		}),
 	],
 	loader: {
+		".png": "file",
 		".svg": "file",
 		".woff": "file",
 		".woff2": "file",

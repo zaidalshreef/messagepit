@@ -52,13 +52,13 @@ func Send(msg any) {
 
 			b, err := json.Marshal(msg)
 			if err != nil {
-				logger.Log().Errorf("[webhook] invalid data: %s", err.Error())
+				logger.Log().Error("[webhook] unable to encode event")
 				return
 			}
 
 			req, err := http.NewRequest("POST", config.WebhookURL, bytes.NewBuffer(b))
 			if err != nil {
-				logger.Log().Errorf("[webhook] error: %s", err.Error())
+				logger.Log().Error("[webhook] error: invalid callback URL")
 				return
 			}
 
@@ -72,13 +72,13 @@ func Send(msg any) {
 			client := &http.Client{Timeout: 5 * time.Second}
 			resp, err := client.Do(req)
 			if err != nil {
-				logger.Log().Errorf("[webhook] error sending data: %s", err.Error())
+				logger.Log().Errorf("[webhook] error sending data: %s", logger.HTTPErrorSummary(err))
 				return
 			}
 			defer func() { _ = resp.Body.Close() }()
 
 			if resp.StatusCode < 200 || resp.StatusCode > 299 {
-				logger.Log().Warnf("[webhook] %s returned a %d status", config.WebhookURL, resp.StatusCode)
+				logger.Log().Warnf("[webhook] endpoint returned a %d status", resp.StatusCode)
 				return
 			}
 		}()

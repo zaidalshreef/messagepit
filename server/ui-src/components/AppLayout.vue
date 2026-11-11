@@ -5,11 +5,15 @@ import { mailbox } from "../stores/mailbox";
 import { smsStore } from "../stores/sms";
 import { webhooksStore } from "../stores/webhooks";
 
+const oidcEnabled = document.getElementById("app")?.dataset.oidc === "true";
+const mailboxAccess = document.getElementById("app")?.dataset.mailboxAccess !== "false";
+
 defineProps({
 	activeTab: { type: String, default: "" },
 	offcanvasId: { type: String, required: true },
 	offcanvasTitle: { type: String, default: "MessagePit" },
 	brandTo: { type: String, default: "/" },
+	showSidebar: { type: Boolean, default: true },
 	loading: { type: Number, default: 0 },
 });
 
@@ -21,16 +25,17 @@ function formatNumber(nr) {
 </script>
 
 <template>
-	<div class="navbar navbar-expand-lg row flex-shrink-0 bg-primary text-white d-print-none" data-bs-theme="dark">
-		<div class="col-xl-2 col-md-3 col-auto pe-0">
+	<div class="navbar navbar-expand-xl row flex-shrink-0 bg-primary text-white d-print-none" data-bs-theme="dark">
+		<div class="col-xl-2 col-auto pe-0 order-1">
 			<RouterLink :to="brandTo" class="navbar-brand text-white me-0" @click="$emit('brand-click')">
 				<i class="bi bi-funnel-fill"></i>
 				<span class="ms-2 d-none d-sm-inline">MessagePit</span>
 			</RouterLink>
 		</div>
-		<div class="col col-md-4 col-lg-5 col-xl-6 d-flex align-items-center gap-3">
-			<div v-if="activeTab" class="nav nav-pills flex-shrink-0">
+		<div class="col-12 col-xl-7 d-flex flex-wrap align-items-center gap-2 order-3 order-xl-2">
+			<div v-if="activeTab" class="nav nav-pills">
 				<RouterLink
+					v-if="mailboxAccess"
 					to="/"
 					class="nav-link text-white px-3"
 					:class="activeTab === 'email' ? 'active bg-white bg-opacity-25' : 'opacity-75'"
@@ -42,6 +47,7 @@ function formatNumber(nr) {
 					</span>
 				</RouterLink>
 				<RouterLink
+					v-if="mailboxAccess"
 					to="/sms"
 					class="nav-link text-white px-3"
 					:class="activeTab === 'sms' ? 'active bg-white bg-opacity-25' : 'opacity-75'"
@@ -53,6 +59,7 @@ function formatNumber(nr) {
 					</span>
 				</RouterLink>
 				<RouterLink
+					v-if="mailboxAccess"
 					to="/webhooks"
 					class="nav-link text-white px-3"
 					:class="activeTab === 'webhooks' ? 'active bg-white bg-opacity-25' : 'opacity-75'"
@@ -63,11 +70,29 @@ function formatNumber(nr) {
 						{{ formatNumber(webhooksStore.unread) }}
 					</span>
 				</RouterLink>
+				<RouterLink
+					v-if="oidcEnabled"
+					to="/projects"
+					class="nav-link text-white px-3"
+					:class="activeTab === 'projects' ? 'active bg-white bg-opacity-25' : 'opacity-75'"
+				>
+					<i class="bi bi-grid-fill me-1"></i>
+					Projects
+				</RouterLink>
+				<RouterLink
+					v-if="oidcEnabled"
+					to="/groups"
+					class="nav-link text-white px-3"
+					:class="activeTab === 'groups' ? 'active bg-white bg-opacity-25' : 'opacity-75'"
+				>
+					<i class="bi bi-people-fill me-1"></i>
+					Groups
+				</RouterLink>
 			</div>
 			<slot name="search" />
 		</div>
-		<div class="col-12 col-md-auto col-lg-4 col-xl-4 d-flex align-items-center justify-content-end mt-2 mt-md-0">
-			<div class="me-auto d-md-none">
+		<div class="col col-xl-3 d-flex align-items-center justify-content-end order-2 order-xl-3">
+			<div v-if="showSidebar" class="me-auto d-md-none">
 				<button
 					class="btn btn-outline-light me-2"
 					type="button"
@@ -83,6 +108,7 @@ function formatNumber(nr) {
 	</div>
 
 	<div
+		v-if="showSidebar"
 		:id="offcanvasId"
 		class="offcanvas-md offcanvas-start d-md-none"
 		data-bs-scroll="true"
@@ -109,12 +135,12 @@ function formatNumber(nr) {
 	</div>
 
 	<div class="row flex-fill" style="min-height: 0">
-		<div class="d-none d-md-flex h-100 col-xl-2 col-md-3 flex-column">
+		<div v-if="showSidebar" class="d-none d-md-flex h-100 col-xl-2 col-md-3 flex-column">
 			<div class="flex-grow-1 overflow-y-auto me-n3 pe-3">
 				<slot name="sidebar" />
 			</div>
 		</div>
-		<div class="col-xl-10 col-md-9 d-flex flex-column mh-100 ps-0 ps-md-2 pe-0">
+		<div class="d-flex flex-column mh-100 ps-0 ps-md-2 pe-0" :class="showSidebar ? 'col-xl-10 col-md-9' : 'col-12'">
 			<slot />
 		</div>
 	</div>

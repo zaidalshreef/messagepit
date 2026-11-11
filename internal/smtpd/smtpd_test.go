@@ -752,6 +752,25 @@ func TestReadDataWithMaxSize(t *testing.T) {
 	}
 }
 
+func TestReadDataBoundsLongLinesAndDrainsOversizedMessage(t *testing.T) {
+	input := strings.Repeat("x", 1<<20) + "\r\n.\r\nNOOP\r\n"
+	s := &session{srv: &Server{MaxSize: 256}, br: bufio.NewReaderSize(strings.NewReader(input), 64)}
+	if _, err := s.readData(); err != maxSizeExceeded(256) {
+		t.Fatalf("oversized message: %v", err)
+	}
+	line, err := s.br.ReadString('\n')
+	if err != nil || line != "NOOP\r\n" {
+		t.Fatalf("message was not drained: %q %v", line, err)
+	}
+
+	longLine := ".." + strings.Repeat("x", 8192) + "\r\n.\r\n"
+	s = &session{srv: &Server{}, br: bufio.NewReaderSize(strings.NewReader(longLine), 64)}
+	data, err := s.readData()
+	if err != nil || string(data) != longLine[1:len(longLine)-3] {
+		t.Fatalf("long dot-stuffed line was changed: %v", err)
+	}
+}
+
 // Utility function for parsing extensions listed as service extensions in response to an EHLO command.
 func parseExtensions(t *testing.T, greeting string) map[string]string {
 	extensions := make(map[string]string)

@@ -4,7 +4,6 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
-	"mime"
 	"net/http"
 	"net/mail"
 	"strings"
@@ -32,11 +31,13 @@ func BearerAuth(w http.ResponseWriter, r *http.Request, key, logPrefix string) b
 }
 
 func FormatAddress(email, name string) (string, error) {
-	if _, err := mail.ParseAddress(email); err != nil {
+	address, err := mail.ParseAddress(email)
+	if err != nil {
 		return "", fmt.Errorf("invalid email address: %s", email)
 	}
 	if name != "" {
-		return fmt.Sprintf("%s <%s>", mime.QEncoding.Encode("utf-8", name), email), nil
+		address.Name = name
+		return address.String(), nil
 	}
 	return email, nil
 }

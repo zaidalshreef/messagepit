@@ -2,6 +2,7 @@
 package auth
 
 import (
+	"errors"
 	"regexp"
 	"strings"
 
@@ -21,78 +22,52 @@ var (
 
 // SetUIAuth will set Basic Auth credentials required for the UI & API
 func SetUIAuth(s string) error {
-	var err error
-
-	credentials := credentialsFromString(s)
-	if len(credentials) == 0 {
-		return nil
-	}
-
-	r := strings.NewReader(strings.Join(credentials, "\n"))
-
-	UICredentials, err = htpasswd.NewFromReader(r, htpasswd.DefaultSystems, nil)
+	credentials, err := parseCredentials(s)
 	if err != nil {
 		return err
 	}
-
+	UICredentials = credentials
 	return nil
 }
 
 // SetSendAPIAuth will set Send API credentials
 func SetSendAPIAuth(s string) error {
-	var err error
-
-	credentials := credentialsFromString(s)
-	if len(credentials) == 0 {
-		return nil
-	}
-
-	r := strings.NewReader(strings.Join(credentials, "\n"))
-
-	SendAPICredentials, err = htpasswd.NewFromReader(r, htpasswd.DefaultSystems, nil)
+	credentials, err := parseCredentials(s)
 	if err != nil {
 		return err
 	}
-
+	SendAPICredentials = credentials
 	return nil
 }
 
 // SetSMTPAuth will set SMTP credentials
 func SetSMTPAuth(s string) error {
-	var err error
-
-	credentials := credentialsFromString(s)
-	if len(credentials) == 0 {
-		return nil
-	}
-
-	r := strings.NewReader(strings.Join(credentials, "\n"))
-
-	SMTPCredentials, err = htpasswd.NewFromReader(r, htpasswd.DefaultSystems, nil)
+	credentials, err := parseCredentials(s)
 	if err != nil {
 		return err
 	}
-
+	SMTPCredentials = credentials
 	return nil
 }
 
 // SetPOP3Auth will set POP3 server credentials
 func SetPOP3Auth(s string) error {
-	var err error
-
-	credentials := credentialsFromString(s)
-	if len(credentials) == 0 {
-		return nil
-	}
-
-	r := strings.NewReader(strings.Join(credentials, "\n"))
-
-	POP3Credentials, err = htpasswd.NewFromReader(r, htpasswd.DefaultSystems, nil)
+	credentials, err := parseCredentials(s)
 	if err != nil {
 		return err
 	}
-
+	POP3Credentials = credentials
 	return nil
+}
+
+func parseCredentials(s string) (*htpasswd.File, error) {
+	credentials := credentialsFromString(s)
+	if len(credentials) == 0 {
+		return nil, errors.New("authentication credentials must not be empty")
+	}
+
+	r := strings.NewReader(strings.Join(credentials, "\n"))
+	return htpasswd.NewFromReader(r, htpasswd.DefaultSystems, nil)
 }
 
 func credentialsFromString(s string) []string {

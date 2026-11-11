@@ -15,6 +15,7 @@ import (
 	"github.com/coreydaley/messagepit/config"
 	"github.com/coreydaley/messagepit/internal/logger"
 	"github.com/coreydaley/messagepit/internal/tools"
+	"github.com/coreydaley/messagepit/internal/transport"
 	"github.com/vanng822/go-premailer/premailer"
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
@@ -145,19 +146,19 @@ func inlineRemoteCSS(h string) (string, error) {
 		for _, a := range attributes {
 			if a.Key == "href" {
 				if config.BlockRemoteCSSAndFonts {
-					logger.Log().Debugf("[html-check] skip testing remote CSS content: %s (--block-remote-css-and-fonts)", a.Val)
+					logger.Log().Debug("[html-check] skip testing remote CSS content (--block-remote-css-and-fonts)")
 					return h, nil
 				}
 
 				if !isValidURL(a.Val) {
 					// skip invalid URL
-					logger.Log().Warnf("[html-check] ignoring unsupported stylesheet URL: %s", a.Val)
+					logger.Log().Warn("[html-check] ignoring unsupported stylesheet URL")
 					continue
 				}
 
 				resp, err := downloadCSSToBytes(a.Val)
 				if err != nil {
-					logger.Log().Warnf("[html-check] %s", err.Error())
+					logger.Log().Warnf("[html-check] could not download stylesheet: %s", logger.HTTPErrorSummary(err))
 					continue
 				}
 
@@ -179,7 +180,7 @@ func inlineRemoteCSS(h string) (string, error) {
 
 	newDoc, err := doc.Html()
 	if err != nil {
-		logger.Log().Warnf("[html-check] failed to download %s", err.Error())
+		logger.Log().Warn("[html-check] failed to render HTML")
 		return h, err
 	}
 
@@ -279,10 +280,8 @@ func newSafeHTTPClient() *http.Client {
 	}
 
 	tr := &http.Transport{
-		Proxy: nil, // avoid env proxy surprises unless you explicitly want it
-		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-			return dialer.DialContext(ctx, network, address)
-		},
+		Proxy:                 nil, // avoid env proxy surprises unless you explicitly want it
+		DialContext:           transport.InspectionDialContext(dialer, config.AllowInternalHTTPRequests),
 		TLSHandshakeTimeout:   5 * time.Second,
 		ResponseHeaderTimeout: 10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,

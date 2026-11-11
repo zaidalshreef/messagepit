@@ -1,37 +1,50 @@
 package storage
 
 import (
+	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/coreydaley/messagepit/config"
 )
 
-var bcStatsDelay = false
+var bcStatsDelay atomic.Bool
 
 // BroadcastMailboxStats broadcasts the total number of messages
 // displayed to the web UI, as well as the total unread messages.
 // The lookup is very fast (< 10ms / 100k messages under load).
 // Rate limited to 4x per second.
 func BroadcastMailboxStats() {
-	if bcStatsDelay {
+	broadcastStats := BroadcastFunc
+	if broadcastStats == nil || !bcStatsDelay.CompareAndSwap(false, true) {
 		return
 	}
-
-	bcStatsDelay = true
+	database := db
+	if database == nil {
+		bcStatsDelay.Store(false)
+		return
+	}
+	table := tenant("mailbox")
+	version := config.Version
 
 	go func() {
+		defer bcStatsDelay.Store(false)
 		time.Sleep(250 * time.Millisecond)
-		bcStatsDelay = false
+		var total, unread float64 // float64 also works with rqlite
+		query := fmt.Sprintf(`SELECT COUNT(*), COALESCE(SUM(CASE WHEN Read = 0 THEN 1 ELSE 0 END), 0) FROM %s`, table)
+		if err := database.QueryRow(query).Scan(&total, &unread); err != nil {
+			return
+		}
 		b := struct {
 			Total   uint64
 			Unread  uint64
 			Version string
 		}{
-			Total:   CountTotal(),
-			Unread:  CountUnread(),
-			Version: config.Version,
+			Total:   uint64(total),
+			Unread:  uint64(unread),
+			Version: version,
 		}
 
-		broadcast("stats", b)
+		broadcastStats("stats", b)
 	}()
 }

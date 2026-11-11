@@ -1,7 +1,6 @@
 package linkcheck
 
 import (
-	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -15,6 +14,7 @@ import (
 	"github.com/coreydaley/messagepit/config"
 	"github.com/coreydaley/messagepit/internal/logger"
 	"github.com/coreydaley/messagepit/internal/tools"
+	"github.com/coreydaley/messagepit/internal/transport"
 )
 
 func getHTTPStatuses(links []string, followRedirects bool) []Link {
@@ -77,7 +77,7 @@ func doHead(link string, followRedirects bool) (int, error) {
 	}
 
 	tr := &http.Transport{
-		DialContext: safeDialContext(dialer),
+		DialContext: transport.InspectionDialContext(dialer, config.AllowInternalHTTPRequests),
 	}
 
 	if config.AllowUntrustedTLS {
@@ -96,7 +96,7 @@ func doHead(link string, followRedirects bool) (int, error) {
 				return http.ErrUseLastResponse
 			}
 			if !tools.IsValidLinkURL(req.URL.String()) {
-				return fmt.Errorf("blocked redirect to invalid URL: %s", req.URL)
+				return errors.New("blocked redirect to invalid URL")
 			}
 			return nil
 		},
@@ -104,7 +104,7 @@ func doHead(link string, followRedirects bool) (int, error) {
 
 	req, err := http.NewRequest("HEAD", link, nil)
 	if err != nil {
-		logger.Log().Errorf("[link-check] %s", err.Error())
+		logger.Log().Error("[link-check] could not construct request")
 		return 0, err
 	}
 
@@ -134,30 +134,4 @@ func httpErrorSummary(err error) string {
 	parts := re.FindAllStringSubmatch(e, -1)
 
 	return parts[0][len(parts[0])-1]
-}
-
-// SafeDialContext is a custom dialer that checks if the resolved IP addresses are internal before allowing the connection.
-func safeDialContext(dialer *net.Dialer) func(ctx context.Context, network, address string) (net.Conn, error) {
-	return func(ctx context.Context, network, address string) (net.Conn, error) {
-		host, port, err := net.SplitHostPort(address)
-		if err != nil {
-			return nil, err
-		}
-
-		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-		if err != nil {
-			return nil, err
-		}
-
-		if !config.AllowInternalHTTPRequests {
-			for _, ip := range ips {
-				if tools.IsInternalIP(ip.IP) {
-					logger.Log().Warnf("[link-check] Blocked HEAD request to private/reserved address: %s (%s)", host, ip)
-					return nil, fmt.Errorf("blocked request to %s (%s): private/reserved address", host, ip)
-				}
-			}
-		}
-
-		return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
-	}
 }

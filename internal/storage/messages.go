@@ -19,6 +19,7 @@ import (
 
 	"github.com/coreydaley/messagepit/config"
 	"github.com/coreydaley/messagepit/internal/logger"
+	"github.com/coreydaley/messagepit/internal/scopedevents"
 	"github.com/coreydaley/messagepit/internal/tools"
 	"github.com/jhillyerd/enmime/v2"
 	"github.com/leporo/sqlf"
@@ -29,12 +30,27 @@ import (
 // The username is the authentication username of either the SMTP or HTTP client (blank for none).
 // Returns the database ID of the saved message.
 func Store(body *[]byte, username *string) (string, error) {
+	return storeMessage(context.Background(), "", body, username)
+}
+
+// StoreInEnvironment atomically saves an email and its environment ownership.
+func StoreInEnvironment(ctx context.Context, environmentID string, body *[]byte, username *string) (string, error) {
+	if environmentID == "" {
+		return "", ErrEnvironmentNotFound
+	}
+	return storeMessage(ctx, environmentID, body, username)
+}
+
+func storeMessage(ctx context.Context, environmentID string, body *[]byte, username *string) (string, error) {
 	parser := enmime.NewParser(enmime.DisableCharacterDetection(true))
 
 	// Parse message body with enmime
 	env, err := parser.ReadEnvelope(bytes.NewReader(*body))
 	if err != nil {
 		logger.Log().Warnf("[message] %s", err.Error())
+		if environmentID != "" {
+			return "", fmt.Errorf("parse message: %w", err)
+		}
 		return "", nil
 	}
 
@@ -80,7 +96,6 @@ func Store(body *[]byte, username *string) (string, error) {
 
 	// begin a transaction to ensure both the message
 	// and data are stored successfully
-	ctx := context.Background()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", err
@@ -128,8 +143,19 @@ func Store(body *[]byte, username *string) (string, error) {
 		return "", err
 	}
 
+	if environmentID != "" {
+		if err := addOwnership(ctx, tx, "email", id, environmentID, env.GetHeader(CorrelationHeader)); err != nil {
+			return "", err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return "", err
+	}
+	if environmentID != "" {
+		scopedevents.Notify(environmentID)
+		// Legacy tags, broadcasts, callbacks, and event webhooks are global.
+		// Do not run them for scoped messages until those features are scoped.
+		return id, nil
 	}
 
 	// extract tags using pre-set tag filters, empty slice if not set
@@ -205,7 +231,7 @@ func Store(body *[]byte, username *string) (string, error) {
 	}
 	fireEmailEvents(env, toEmail)
 
-	dbLastAction = time.Now()
+	markDatabaseAction()
 
 	BroadcastMailboxStats()
 
@@ -217,12 +243,27 @@ func Store(body *[]byte, username *string) (string, error) {
 // List returns a subset of messages from the mailbox,
 // sorted latest to oldest
 func List(start int, beforeTS int64, limit int) ([]MessageSummary, error) {
+	return listMessages("", start, beforeTS, limit)
+}
+
+// ListEnvironmentMessages returns messages belonging to one environment.
+func ListEnvironmentMessages(environmentID string, start int, beforeTS int64, limit int) ([]MessageSummary, error) {
+	if environmentID == "" {
+		return nil, ErrEnvironmentNotFound
+	}
+	return listMessages(environmentID, start, beforeTS, limit)
+}
+
+func listMessages(environmentID string, start int, beforeTS int64, limit int) ([]MessageSummary, error) {
 	results := []MessageSummary{}
 	tsStart := time.Now()
 
 	q := sqlf.From(tenant("mailbox") + " m").
 		Select(`m.Created, m.ID, m.MessageID, m.Subject, m.Metadata, m.Size, m.Attachments, m.Read, m.Snippet`).
 		OrderBy("m.Created DESC")
+	if environmentID != "" {
+		q = q.Where(ownershipPredicate("m.ID"), "email", LegacyEnvironmentID, environmentID)
+	}
 
 	if limit > 0 {
 		q = q.Limit(limit).Offset(start)
@@ -286,7 +327,7 @@ func List(start int, beforeTS int64, limit int) ([]MessageSummary, error) {
 		results[i].Tags = getMessageTags(m.ID)
 	}
 
-	dbLastAction = time.Now()
+	markDatabaseAction()
 
 	elapsed := time.Since(tsStart)
 
@@ -298,6 +339,15 @@ func List(start int, beforeTS int64, limit int) ([]MessageSummary, error) {
 // GetMessage returns a Message generated from the mailbox_data collection.
 // If the message lacks a date header, then the received datetime is used.
 func GetMessage(id string) (*Message, error) {
+	return getMessage(id, true)
+}
+
+// ReadMessage returns a message without changing its read status.
+func ReadMessage(id string) (*Message, error) {
+	return getMessage(id, false)
+}
+
+func getMessage(id string, markRead bool) (*Message, error) {
 	raw, err := GetMessageRaw(id)
 	if err != nil {
 		return nil, err
@@ -410,11 +460,13 @@ func GetMessage(id string) (*Message, error) {
 	}
 
 	// mark message as read
-	if err := MarkRead([]string{id}); err != nil {
-		return &obj, err
+	if markRead {
+		if err := MarkRead([]string{id}); err != nil {
+			return &obj, err
+		}
 	}
 
-	dbLastAction = time.Now()
+	markDatabaseAction()
 
 	return &obj, nil
 }
@@ -447,7 +499,7 @@ func GetMessageRaw(id string) ([]byte, error) {
 		data = []byte(msg)
 	}
 
-	dbLastAction = time.Now()
+	markDatabaseAction()
 
 	if compressed == 1 {
 		raw, err := dbDecoder.DecodeAll(data, nil)
@@ -495,7 +547,7 @@ func GetAttachmentPart(id, partID string) (*enmime.Part, error) {
 		}
 	}
 
-	dbLastAction = time.Now()
+	markDatabaseAction()
 
 	return nil, errors.New("attachment not found")
 }
@@ -595,7 +647,7 @@ func MarkAllRead() error {
 
 	BroadcastMailboxStats()
 
-	dbLastAction = time.Now()
+	markDatabaseAction()
 
 	return nil
 }
@@ -620,7 +672,7 @@ func MarkAllUnread() error {
 
 	BroadcastMailboxStats()
 
-	dbLastAction = time.Now()
+	markDatabaseAction()
 
 	return nil
 }
@@ -637,7 +689,7 @@ func MarkUnread(ids []string) error {
 			logger.Log().Debugf("[db] marked message %s as unread", id)
 		}
 
-		dbLastAction = time.Now()
+		markDatabaseAction()
 
 		d := struct {
 			ID   string
@@ -720,7 +772,7 @@ func DeleteMessages(ids []string) error {
 		return err
 	}
 
-	dbLastAction = time.Now()
+	markDatabaseAction()
 	addDeletedSize(totalSize)
 
 	logMessagesDeleted(len(toDelete))
@@ -790,7 +842,7 @@ func DeleteAllMessages() error {
 
 	vacuumDb()
 
-	dbLastAction = time.Now()
+	markDatabaseAction()
 	if err := SettingPut("DeletedSize", "0"); err != nil {
 		logger.Log().Warnf("[db] %s", err.Error())
 	}

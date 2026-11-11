@@ -3,6 +3,7 @@ package smtpd
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net"
 	"net/mail"
@@ -10,8 +11,10 @@ import (
 	"strings"
 
 	"github.com/coreydaley/messagepit/config"
+	"github.com/coreydaley/messagepit/internal/access"
 	"github.com/coreydaley/messagepit/internal/auth"
 	"github.com/coreydaley/messagepit/internal/logger"
+	"github.com/coreydaley/messagepit/internal/serviceauth"
 	"github.com/coreydaley/messagepit/internal/stats"
 	"github.com/coreydaley/messagepit/internal/storage"
 	"github.com/coreydaley/messagepit/internal/tools"
@@ -29,11 +32,26 @@ var (
 
 // MailHandler handles the incoming message to store in the database
 func mailHandler(origin net.Addr, from string, to []string, data []byte, smtpUser *string) (string, error) {
+	if config.SharedAuthEnabled() {
+		if smtpUser == nil || !strings.HasPrefix(*smtpUser, "mpt_") {
+			return "", serviceauth.ErrUnauthorized
+		}
+		token, err := storage.ActiveServiceToken(context.Background(), strings.TrimPrefix(*smtpUser, "mpt_"))
+		if err != nil || !token.Role.Allows(access.WriteMessages) {
+			return "", serviceauth.ErrUnauthorized
+		}
+		username := "smtp"
+		return saveToDatabase(origin, from, to, data, &username, token.EnvironmentID)
+	}
 	return SaveToDatabase(origin, from, to, data, smtpUser)
 }
 
 // SaveToDatabase will attempt to save a message to the database
 func SaveToDatabase(origin net.Addr, from string, to []string, data []byte, smtpUser *string) (string, error) {
+	return saveToDatabase(origin, from, to, data, smtpUser, "")
+}
+
+func saveToDatabase(origin net.Addr, from string, to []string, data []byte, smtpUser *string, environmentID string) (string, error) {
 	if !config.SMTPStrictRFCHeaders && bytes.Contains(data, []byte("\r\r\n")) {
 		// replace all <CR><CR><LF> (\r\r\n) with <CR><LF> (\r\n)
 		// @see https://github.com/coreydaley/messagepit/issues/87 & https://github.com/coreydaley/messagepit/issues/153
@@ -64,7 +82,7 @@ func SaveToDatabase(origin net.Addr, from string, to []string, data []byte, smtp
 		messageID = shortuuid.New() + "@messagepit"
 		// add unique ID
 		data = append([]byte("Message-ID: <"+messageID+">\r\n"), data...)
-	} else if config.IgnoreDuplicateIDs {
+	} else if config.IgnoreDuplicateIDs && environmentID == "" {
 		if storage.MessageIDExists(messageID) {
 			logger.Log().Debugf("[smtpd] duplicate message found, ignoring %s", messageID)
 			stats.LogSMTPIgnored()
@@ -73,7 +91,12 @@ func SaveToDatabase(origin net.Addr, from string, to []string, data []byte, smtp
 	}
 
 	// if enabled, this may conditionally relay the email through to the preconfigured smtp server
-	if relayErr := autoRelayMessage(from, to, &data); relayErr != nil {
+	if relayErr := func() error {
+		if environmentID != "" {
+			return nil
+		}
+		return autoRelayMessage(from, to, &data)
+	}(); relayErr != nil {
 		logger.Log().Error(relayErr.Error())
 
 		if config.SMTPRelayConfig.ForwardSMTPErrors {
@@ -89,7 +112,12 @@ func SaveToDatabase(origin net.Addr, from string, to []string, data []byte, smtp
 	}
 
 	// if enabled, this will forward a copy to preconfigured addresses
-	if forwardErr := autoForwardMessage(from, &data); forwardErr != nil {
+	if forwardErr := func() error {
+		if environmentID != "" {
+			return nil
+		}
+		return autoForwardMessage(from, &data)
+	}(); forwardErr != nil {
 		logger.Log().Error(forwardErr.Error())
 
 		if config.SMTPForwardConfig.ForwardSMTPErrors {
@@ -136,8 +164,16 @@ func SaveToDatabase(origin net.Addr, from string, to []string, data []byte, smtp
 		logger.Log().Debugf("[smtpd] added missing addresses to Bcc header: %s", strings.Join(missingAddresses, ", "))
 	}
 
-	id, err := storage.Store(&data, smtpUser)
+	var id string
+	if environmentID != "" {
+		id, err = storage.StoreInEnvironment(context.Background(), environmentID, &data, smtpUser)
+	} else {
+		id, err = storage.Store(&data, smtpUser)
+	}
 	if err != nil {
+		if errors.Is(err, storage.ErrInvalidCorrelationID) {
+			return "", errors.New("550 5.5.0 invalid correlation ID")
+		}
 		logger.Log().Errorf("[db] error storing message: %s", err.Error())
 		return "", err
 	}
@@ -153,6 +189,10 @@ func SaveToDatabase(origin net.Addr, from string, to []string, data []byte, smtp
 }
 
 func authHandler(remoteAddr net.Addr, mechanism string, username []byte, password []byte, _ []byte) (bool, error) {
+	if config.SharedAuthEnabled() {
+		token, err := serviceauth.Authenticate(context.Background(), string(password))
+		return err == nil && string(username) == "mpt_"+token.ID, nil
+	}
 	allow := auth.SMTPCredentials.Match(string(username), string(password))
 	if allow {
 		logger.Log().Debugf("[smtpd] allow %s login:%q from:%s", mechanism, string(username), cleanIP(remoteAddr))
@@ -258,7 +298,16 @@ func listenAndServe(addr string, handler MsgIDHandler, authHandler AuthHandler) 
 		}
 	}
 
-	if auth.SMTPCredentials != nil {
+	if config.SharedAuthEnabled() {
+		srv.MaxSize = 10 << 20
+		srv.AuthMechs = map[string]bool{"CRAM-MD5": false}
+		if config.SMTPAuthAllowInsecure {
+			srv.AuthMechs["PLAIN"] = true
+			srv.AuthMechs["LOGIN"] = true
+		}
+		srv.AuthHandler = authHandler
+		srv.AuthRequired = true
+	} else if auth.SMTPCredentials != nil {
 		srv.AuthMechs = map[string]bool{
 			"CRAM-MD5": false,
 			"PLAIN":    true,

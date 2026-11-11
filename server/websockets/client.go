@@ -5,6 +5,7 @@
 package websockets
 
 import (
+	"context"
 	"net/http"
 	"time"
 
@@ -114,7 +115,7 @@ func (c *Client) writePump() {
 }
 
 // ServeWs handles websocket requests from the peer.
-func ServeWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
+func ServeWs(hub *Hub, w http.ResponseWriter, r *http.Request, lifetime context.Context) {
 	if auth.UICredentials != nil {
 		user, pass, ok := r.BasicAuth()
 
@@ -139,7 +140,13 @@ func ServeWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	client.hub.register <- client
 
 	// Allow collection of memory referenced by the caller by doing all work in new goroutines.
-	go client.readPump()
+	go func() {
+		if lifetime != nil {
+			stop := context.AfterFunc(lifetime, func() { _ = conn.Close() })
+			defer stop()
+		}
+		client.readPump()
+	}()
 	go client.writePump()
 }
 

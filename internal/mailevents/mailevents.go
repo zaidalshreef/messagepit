@@ -218,7 +218,7 @@ func post(event map[string]any) {
 
 	body, err := json.Marshal([]map[string]any{event})
 	if err != nil {
-		logger.Log().Errorf("[email-webhook] marshal error: %s", err)
+		logger.Log().Error("[email-webhook] unable to encode event")
 		return
 	}
 
@@ -226,13 +226,13 @@ func post(event map[string]any) {
 	hash := sha256.Sum256([]byte(ts + string(body)))
 	sig, err := key.Sign(rand.Reader, hash[:], crypto.SHA256)
 	if err != nil {
-		logger.Log().Errorf("[email-webhook] signing error: %s", err)
+		logger.Log().Error("[email-webhook] unable to sign event")
 		return
 	}
 
 	req, err := http.NewRequest("POST", config.EmailWebhookURL, bytes.NewReader(body))
 	if err != nil {
-		logger.Log().Errorf("[email-webhook] request error: %s", err)
+		logger.Log().Error("[email-webhook] invalid callback URL")
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -243,14 +243,14 @@ func post(event map[string]any) {
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		logger.Log().Errorf("[email-webhook] error: %s", err)
+		logger.Log().Errorf("[email-webhook] %s", logger.HTTPErrorSummary(err))
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		logger.Log().Warnf("[email-webhook] %s returned %d for %q", config.EmailWebhookURL, resp.StatusCode, event["event"])
+		logger.Log().Warnf("[email-webhook] endpoint returned %d for %q", resp.StatusCode, event["event"])
 	} else {
-		logger.Log().Debugf("[email-webhook] %q event sent for %s", event["event"], event["email"])
+		logger.Log().Debugf("[email-webhook] %q event sent", event["event"])
 	}
 }

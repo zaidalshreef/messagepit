@@ -2,6 +2,7 @@
 package cmd
 
 import (
+	"context"
 	"os"
 	"strconv"
 	"strings"
@@ -39,6 +40,14 @@ Documentation:
 			logger.Log().Fatal(err.Error())
 			os.Exit(1)
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := server.InitSharedAuth(ctx); err != nil {
+			cancel()
+			storage.Close()
+			logger.Log().Error(err.Error())
+			os.Exit(1)
+		}
+		cancel()
 
 		// Start Prometheus metrics if enabled
 		switch prometheus.GetMode() {
@@ -105,11 +114,21 @@ func init() {
 	rootCmd.Flags().StringVarP(&config.HTTPListen, "listen", "l", config.HTTPListen, "HTTP bind interface & port for UI")
 	rootCmd.Flags().StringVar(&config.Webroot, "webroot", config.Webroot, "Set the webroot for web UI & API")
 	rootCmd.Flags().StringVar(&config.UIAuthFile, "ui-auth-file", config.UIAuthFile, "A password file for web UI & API authentication")
+	rootCmd.Flags().BoolVar(&config.LocalAuth, "local-auth", config.LocalAuth, "Enable local username/password accounts for shared projects")
+	rootCmd.Flags().StringVar(&config.LocalPublicURL, "local-public-url", config.LocalPublicURL, "Public origin for local sign-in")
+	rootCmd.Flags().StringVar(&config.LocalAdminUsername, "local-admin-username", config.LocalAdminUsername, "Initial local administrator username")
+	rootCmd.Flags().StringVar(&config.OIDC.Issuer, "oidc-issuer", config.OIDC.Issuer, "OIDC issuer URL")
+	rootCmd.Flags().StringVar(&config.OIDC.ClientID, "oidc-client-id", config.OIDC.ClientID, "OIDC client ID")
+	rootCmd.Flags().StringVar(&config.OIDC.PublicURL, "oidc-public-url", config.OIDC.PublicURL, "Public origin of the web UI")
+	rootCmd.Flags().StringVar(&config.OIDC.AllowedSubjects, "oidc-allowed-subjects", config.OIDC.AllowedSubjects, "Comma-separated OIDC subject IDs allowed access")
+	rootCmd.Flags().StringVar(&config.OIDC.AdminSubjects, "oidc-admin-subjects", config.OIDC.AdminSubjects, "Comma-separated OIDC subject IDs allowed to administer groups")
+	rootCmd.Flags().StringVar(&config.AI.BaseURL, "ai-base-url", config.AI.BaseURL, "OpenAI-compatible API base URL")
+	rootCmd.Flags().StringVar(&config.AI.Model, "ai-model", config.AI.Model, "Model for optional message summaries")
 	rootCmd.Flags().StringVar(&config.UITLSCert, "ui-tls-cert", config.UITLSCert, "TLS certificate for web UI (HTTPS) - requires ui-tls-key")
 	rootCmd.Flags().StringVar(&config.UITLSKey, "ui-tls-key", config.UITLSKey, "TLS key for web UI (HTTPS) - requires ui-tls-cert")
 	rootCmd.Flags().StringVar(&server.AccessControlAllowOrigin, "api-cors", server.AccessControlAllowOrigin, "Set CORS origin(s) for the API, comma-separated (eg: example.com,foo.com)")
 	rootCmd.Flags().BoolVar(&config.BlockRemoteCSSAndFonts, "block-remote-css-and-fonts", config.BlockRemoteCSSAndFonts, "Block access to remote CSS & fonts")
-	rootCmd.Flags().BoolVar(&config.AllowInternalHTTPRequests, "allow-internal-http-requests", config.AllowInternalHTTPRequests, "Allow link-checker & screenshots to access internal IP addresses")
+	rootCmd.Flags().BoolVar(&config.AllowInternalHTTPRequests, "allow-internal-http-requests", config.AllowInternalHTTPRequests, "Allow HTML and link checks and screenshots to access internal IP addresses")
 	rootCmd.Flags().StringVar(&config.EnableSpamAssassin, "enable-spamassassin", config.EnableSpamAssassin, "Enable integration with SpamAssassin")
 	rootCmd.Flags().BoolVar(&config.AllowUntrustedTLS, "allow-untrusted-tls", config.AllowUntrustedTLS, "Do not verify HTTPS certificates (link checker & screenshots)")
 	rootCmd.Flags().BoolVar(&config.DisableHTTPCompression, "disable-http-compression", config.DisableHTTPCompression, "Disable HTTP compression support (web UI & API)")
@@ -262,9 +281,35 @@ func initConfigFromEnv() {
 		config.Webroot = os.Getenv("MP_WEBROOT")
 	}
 	config.UIAuthFile = os.Getenv("MP_UI_AUTH_FILE")
-	if err := auth.SetUIAuth(os.Getenv("MP_UI_AUTH")); err != nil {
-		logger.Log().Error(err.Error())
+	loadAuthFromEnv("MP_UI_AUTH", auth.SetUIAuth)
+	if value, exists := os.LookupEnv("MP_LOCAL_AUTH"); exists {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "1", "true", "yes":
+			config.LocalAuth = true
+		case "0", "false", "no":
+			config.LocalAuth = false
+		default:
+			logger.Log().Error("MP_LOCAL_AUTH must be true or false")
+			os.Exit(1)
+		}
 	}
+	if value := os.Getenv("MP_LOCAL_PUBLIC_URL"); value != "" {
+		config.LocalPublicURL = value
+	}
+	if value := os.Getenv("MP_LOCAL_ADMIN_USERNAME"); value != "" {
+		config.LocalAdminUsername = value
+	}
+	config.LocalAdminPassword = os.Getenv("MP_LOCAL_ADMIN_PASSWORD")
+	_ = os.Unsetenv("MP_LOCAL_ADMIN_PASSWORD")
+	config.OIDC.Issuer = os.Getenv("MP_OIDC_ISSUER")
+	config.OIDC.ClientID = os.Getenv("MP_OIDC_CLIENT_ID")
+	config.OIDC.ClientSecret = os.Getenv("MP_OIDC_CLIENT_SECRET")
+	config.OIDC.PublicURL = os.Getenv("MP_OIDC_PUBLIC_URL")
+	config.OIDC.AllowedSubjects = os.Getenv("MP_OIDC_ALLOWED_SUBJECTS")
+	config.OIDC.AdminSubjects = os.Getenv("MP_OIDC_ADMIN_SUBJECTS")
+	config.AI.BaseURL = os.Getenv("MP_AI_BASE_URL")
+	config.AI.Model = os.Getenv("MP_AI_MODEL")
+	config.AI.APIKey = os.Getenv("MP_AI_API_KEY")
 	config.UITLSCert = os.Getenv("MP_UI_TLS_CERT")
 	config.UITLSKey = os.Getenv("MP_UI_TLS_KEY")
 	if len(os.Getenv("MP_API_CORS")) > 0 {
@@ -291,9 +336,7 @@ func initConfigFromEnv() {
 
 	// Send API
 	config.SendAPIAuthFile = os.Getenv("MP_SEND_API_AUTH_FILE")
-	if err := auth.SetSendAPIAuth(os.Getenv("MP_SEND_API_AUTH")); err != nil {
-		logger.Log().Error(err.Error())
-	}
+	loadAuthFromEnv("MP_SEND_API_AUTH", auth.SetSendAPIAuth)
 	if getEnabledFromEnv("MP_SEND_API_AUTH_ACCEPT_ANY") {
 		config.SendAPIAuthAcceptAny = true
 	}
@@ -349,9 +392,7 @@ func initConfigFromEnv() {
 		config.SMTPListen = os.Getenv("MP_SMTP_BIND_ADDR")
 	}
 	config.SMTPAuthFile = os.Getenv("MP_SMTP_AUTH_FILE")
-	if err := auth.SetSMTPAuth(os.Getenv("MP_SMTP_AUTH")); err != nil {
-		logger.Log().Error(err.Error())
-	}
+	loadAuthFromEnv("MP_SMTP_AUTH", auth.SetSMTPAuth)
 	if getEnabledFromEnv("MP_SMTP_AUTH_ACCEPT_ANY") {
 		config.SMTPAuthAcceptAny = true
 	}
@@ -435,9 +476,7 @@ func initConfigFromEnv() {
 		config.POP3Listen = os.Getenv("MP_POP3_BIND_ADDR")
 	}
 	config.POP3AuthFile = os.Getenv("MP_POP3_AUTH_FILE")
-	if err := auth.SetPOP3Auth(os.Getenv("MP_POP3_AUTH")); err != nil {
-		logger.Log().Error(err.Error())
-	}
+	loadAuthFromEnv("MP_POP3_AUTH", auth.SetPOP3Auth)
 	config.POP3TLSCert = os.Getenv("MP_POP3_TLS_CERT")
 	config.POP3TLSKey = os.Getenv("MP_POP3_TLS_KEY")
 
@@ -466,6 +505,19 @@ func initConfigFromEnv() {
 
 	// Demo mode
 	config.DemoMode = getEnabledFromEnv("MP_DEMO_MODE")
+}
+
+// loadAuthFromEnv leaves authentication optional when the variable is empty,
+// but rejects invalid configured credentials before any listener starts.
+func loadAuthFromEnv(name string, setCredentials func(string) error) {
+	value := os.Getenv(name)
+	if value == "" {
+		return
+	}
+	if err := setCredentials(value); err != nil {
+		logger.Log().Errorf("[env] %s: %s", name, err)
+		os.Exit(1)
+	}
 }
 
 // load deprecated settings from environment and warn

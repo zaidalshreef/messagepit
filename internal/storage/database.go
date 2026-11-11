@@ -10,6 +10,8 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -28,7 +30,8 @@ import (
 var (
 	db           *sql.DB
 	sqlDriver    string
-	dbLastAction time.Time
+	dbLastAction atomic.Int64
+	dbTasks      *databaseTasks
 
 	// zstd compression encoder & decoder
 	dbEncoder    *zstd.Encoder
@@ -37,8 +40,23 @@ var (
 	temporaryFiles = []string{}
 )
 
+type databaseTasks struct {
+	cancel  context.CancelFunc
+	workers sync.WaitGroup
+	signals chan os.Signal
+	once    sync.Once
+}
+
+func markDatabaseAction() {
+	dbLastAction.Store(time.Now().UnixNano())
+}
+
 // InitDB will initialise the database
 func InitDB() error {
+	dbTasks = nil
+	if err := config.VerifySharedDatabase(); err != nil {
+		return err
+	}
 	// dbEncoder
 	var (
 		dsn string
@@ -90,8 +108,12 @@ func InitDB() error {
 
 	if sqlDriver == "sqlite" {
 		if !isFile(p) {
-			// try create a file to ensure permissions
-			f, err := os.Create(p)
+			// Shared databases contain captured data and local password hashes.
+			mode := os.FileMode(0666)
+			if config.SharedAuthEnabled() {
+				mode = 0600
+			}
+			f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR, mode)
 			if err != nil {
 				return fmt.Errorf("[db] %s", err.Error())
 			}
@@ -138,26 +160,30 @@ func InitDB() error {
 
 	LoadTagFilters()
 
-	dbLastAction = time.Now()
+	markDatabaseAction()
 
-	sigs := make(chan os.Signal, 1)
-	// catch all signals since not explicitly listing
-	// Program that will listen to the SIGINT and SIGTERM
-	// SIGINT will listen to CTRL-C.
-	// SIGTERM will be caught if kill command executed
-	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
-	// method invoked upon seeing signal
+	ctx, cancel := context.WithCancel(context.Background())
+	tasks := &databaseTasks{cancel: cancel, signals: make(chan os.Signal, 1)}
+	dbTasks = tasks
+	signal.Notify(tasks.signals, os.Interrupt, syscall.SIGTERM)
+	tasks.workers.Add(2)
 	go func() {
-		s := <-sigs
-		fmt.Printf("[db] got %s signal, shutting down\n", s)
-		Close()
-		os.Exit(0)
+		defer tasks.workers.Done()
+		dbCron(ctx)
 	}()
-
-	// auto-prune & delete
-	go dbCron()
-
-	go dataMigrations()
+	go func() {
+		defer tasks.workers.Done()
+		dataMigrations()
+	}()
+	go func() {
+		select {
+		case s := <-tasks.signals:
+			fmt.Printf("[db] got %s signal, shutting down\n", s)
+			Close()
+			os.Exit(0)
+		case <-ctx.Done():
+		}
+	}()
 
 	return nil
 }
@@ -167,22 +193,29 @@ func tenant(table string) string {
 	return fmt.Sprintf("%s%s", config.TenantID, table)
 }
 
-// Close will close the database, and delete if temporary
+// Close stops background database work, closes the database, and deletes temporary files.
 func Close() {
-	// on a fatal exit (eg: ports blocked), allow MessagePit to run migration tasks before closing the DB
-	time.Sleep(200 * time.Millisecond)
-
-	if db != nil {
-		if err := db.Close(); err != nil {
-			logger.Log().Warn("[db] error closing database, ignoring")
+	closeDatabase := func() {
+		if db != nil {
+			if err := db.Close(); err != nil {
+				logger.Log().Warn("[db] error closing database, ignoring")
+			}
 		}
+		// Allow SQLite to finish writing WAL logs before deleting temporary files.
+		time.Sleep(100 * time.Millisecond)
+		deleteTempFiles()
 	}
-
-	// allow SQLite to finish closing DB & write WAL logs if local
-	time.Sleep(100 * time.Millisecond)
-
-	// delete all temporary files
-	deleteTempFiles()
+	if dbTasks == nil {
+		closeDatabase()
+		return
+	}
+	tasks := dbTasks
+	tasks.once.Do(func() {
+		signal.Stop(tasks.signals)
+		tasks.cancel()
+		tasks.workers.Wait()
+		closeDatabase()
+	})
 }
 
 // Ping the database connection and return an error if unsuccessful
@@ -198,7 +231,7 @@ func StatsGet() MailboxStats {
 		tags   = GetAllTags()
 	)
 
-	dbLastAction = time.Now()
+	markDatabaseAction()
 
 	return MailboxStats{
 		Total:  total,

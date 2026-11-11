@@ -12,12 +12,14 @@ import { webhooksStore } from "./stores/webhooks";
 
 const route = useRoute();
 const { get, resolve, hideNav } = useCommon();
+const mailboxAccess = document.getElementById("app")?.dataset.mailboxAccess !== "false";
 
 watch(route, () => {
 	hideNav();
 });
 
 onBeforeMount(() => {
+	if (!mailboxAccess) return;
 	get(resolve("/api/v1/webui"), false, (response) => {
 		mailbox.uiConfig = response.data;
 
@@ -44,6 +46,6 @@ onBeforeMount(() => {
 	<RouterView />
 	<Favicon />
 	<AppBadge />
-	<Notifications />
+	<Notifications v-if="mailboxAccess" />
 	<EditTags />
 </template>

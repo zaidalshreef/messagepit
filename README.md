@@ -79,7 +79,7 @@ When `MP_TWILIO_AUTH_TOKEN` is set, every callback carries an `X-Twilio-Signatur
 
 **Priority**: the `StatusCallback` field in the send request takes precedence over the global `MP_TWILIO_WEBHOOK_URL`.
 
-Set `--twilio-callback-delay` (`MP_TWILIO_CALLBACK_DELAY`, e.g. `750ms`) to space the callbacks out. The default is `0` — the states still arrive in order, just without the wall-clock gap.
+Set `--twilio-callback-delay` (`MP_TWILIO_CALLBACK_DELAY`, e.g. `750ms`) to space the callbacks out. The default is `0` — the states still arrive in order, just without the wall-clock gap. Callback logs report the event and response status without recording the destination URL or recipient address.
 
 #### Magic numbers
 
@@ -142,7 +142,9 @@ Authorization: Bearer <MP_SENDGRID_API_KEY>
 Content-Type: application/json
 ```
 
-Point your application's SendGrid SDK at the stub by setting the API base URL to `http://localhost:8100`. The endpoint accepts the standard SendGrid v3 JSON payload (`personalizations`, `from`, `subject`, `content`, `custom_args`) and stores each message in the MessagePit mailbox. Authentication is skipped when `MP_SENDGRID_API_KEY` is empty.
+Point your application's SendGrid SDK at the stub by setting the API base URL to `http://localhost:8100`. The endpoint accepts the supported SendGrid v3 JSON fields (`personalizations`, `from`, `subject`, `content`, `custom_args`) and stores each message in the MessagePit mailbox. In standalone mode, authentication is skipped when `MP_SENDGRID_API_KEY` is empty. Shared mode requires an environment-scoped developer credential.
+
+Custom header names must be valid and unique, ignoring case; reserved SendGrid and generated MIME headers cannot be overridden. Content types must be valid MIME media types, and To, Cc, and Bcc addresses must be valid. Invalid input is rejected before any message is stored.
 
 The SendGrid server defaults to `127.0.0.1:8100` (loopback only). Set `MP_SENDGRID_BIND_ADDR=0.0.0.0:8100` to expose it on all interfaces (e.g. inside Docker). Pass `--sendgrid ""` to disable it entirely (an empty `MP_SENDGRID_BIND_ADDR` is ignored).
 
@@ -278,9 +280,174 @@ All flags can also be set via environment variables (e.g. `--smtp` → `MP_SMTP_
 
 Run `messagepit --help` for the full list.
 
+HTML stylesheet checks, link checks, and the screenshot asset proxy block requests to loopback, private, link-local, and multicast addresses by default. `--allow-internal-http-requests` (or `MP_ALLOW_INTERNAL_HTTP_REQUESTS`) allows them when local resources are needed. This setting applies to all three features, so enable it only when captured message content is trusted. Outbound network controls should also restrict any other internal ranges used by your deployment.
+
+### Local sign-in for shared projects
+
+Local username and password accounts let teams use shared projects without an SSO service. On the first start, choose an administrator password of 12–72 UTF-8 bytes. For example, on a local development machine:
+
+```sh
+export MP_LOCAL_AUTH=1 MP_UI_BIND_ADDR=127.0.0.1:8025
+export MP_DATABASE="$PWD/messagepit.db"
+read -r -s -p 'Initial administrator password: ' MP_LOCAL_ADMIN_PASSWORD; echo
+export MP_LOCAL_ADMIN_PASSWORD
+messagepit
+unset MP_LOCAL_ADMIN_PASSWORD
+```
+
+Open `http://127.0.0.1:8025` and sign in as `admin`. The administrator can create local users in **Groups → Local accounts**, add them to groups, and grant each project separately. There is no public self-registration. Usernames start with a lowercase letter or digit and contain 3–64 lowercase letters, digits, dots, underscores, or hyphens. Users can change their own password; administrators can reset a user's password or disable an account. Password changes invalidate existing sessions, and disabling an account removes its group and project grants. Usernames of disabled accounts cannot be reused.
+
+`MP_LOCAL_ADMIN_USERNAME` changes the initial administrator username. The bootstrap password is used only when the local account table is empty; changing it later does not replace an existing password. The application stores bcrypt password hashes rather than passwords. Sign-in attempts are rate-limited, and browser sessions expire after eight hours or on sign-out or restart. Service credentials belong to an environment rather than the person who issued them, so revoke any credentials that should stop working when an account is disabled.
+
+The default local public origin is `http://127.0.0.1:8025`. Set `MP_LOCAL_PUBLIC_URL` to the exact public origin when using a different host or port. Remote origins require HTTPS; when TLS terminates at a proxy, connect the proxy to a loopback-bound MessagePit listener. Local authentication cannot be combined with OIDC or the existing UI, Send API, SMTP, or POP3 password-file options. The normal standalone mode remains available when shared authentication is not enabled.
+
+For offline administrator recovery, stop MessagePit, set `MP_LOCAL_ADMIN_PASSWORD` to a new password, and run `messagepit reset-local-admin /path/to/messagepit.db`. If the initial administrator had a custom username, add `--username <name>`; if the database uses a tenant prefix, add `--tenant-id <id>`. The command updates the existing account and invalidates its old sessions. Unset the password environment variable afterward.
+
+### Optional OIDC sign-in
+
+OIDC sign-in is optional. Configure an issuer, client ID, public origin, and a comma-separated allowlist of OIDC `sub` values using `MP_OIDC_ISSUER`, `MP_OIDC_CLIENT_ID`, `MP_OIDC_PUBLIC_URL`, and `MP_OIDC_ALLOWED_SUBJECTS`. Set `MP_OIDC_CLIENT_SECRET` securely if the provider requires a confidential client. Register `<public-origin><webroot>auth/callback` as the redirect URI. The provider must support the authorization-code flow with PKCE.
+
+The issuer, public origin, and provider endpoints require HTTPS; HTTP is accepted only for localhost development. OIDC cannot be combined with UI, Send API, SMTP, or POP3 password-file authentication. Browser sessions expire at the identity token's expiry or after eight hours, whichever comes first; they also end on sign-out or process restart. Sign-out ends the MessagePit session but does not sign the user out of the identity provider. Allowed subjects must be maintained in the configuration even after they are added to a group.
+
+### Shared access
+
+Shared local-account or OIDC mode requires a local SQLite database. The existing rqlite driver does not provide transactional commits or rollbacks, so it is rejected in shared mode to protect project isolation. Standalone rqlite use remains available. New shared database files are created with owner-only permissions; restrict access to existing database files and backups as well.
+
+Only system administrators can access the existing instance-wide mailbox. Existing captures are associated with a reserved default environment; grant access to that project explicitly if a user needs it. System administrators can see all captures through the existing mailbox. Other users can inspect only the projects explicitly shared with them through the Projects page and environment APIs.
+
+When shared authentication is enabled, capture listeners require an environment-scoped developer credential. SendGrid and webhook capture accept it as a bearer token; Twilio uses it as the Basic Auth password with the account SID as the username; SMTP uses `mpt_<token-id>` as the username and the entire token as the password. Credentials can be issued and revoked by a system or project administrator. Viewer tokens can read but cannot capture or manage credentials. Tokens expire after at most 24 hours, and their secret is displayed only once.
+
+SMTP authentication requires TLS unless `--smtp-auth-allow-insecure` is explicitly enabled for local development. With shared authentication enabled and neither TLS nor that option configured, SMTP remains closed to unauthenticated submissions. HTTP service credentials are accepted over TLS or a direct loopback connection; bind the HTTP capture listeners to loopback behind a local TLS-terminating proxy when they must be used remotely. Forwarded headers alone do not establish a trusted connection.
+
+In shared mode, SMTP and webhook capture reject bodies over 10 MiB; SendGrid uses the existing 10 MiB limit and SMS requests are limited to 1 MiB.
+
+Scoped captures do not trigger legacy instance-wide broadcasts, tags, forwarding, relay, or delivery callbacks. The project inbox receives environment-scoped live change notifications and refreshes its list; while inspecting a record or viewing a later page, it offers a refresh button instead. Notifications contain no message content, and access is rechecked throughout the connection. Live notifications are local to one MessagePit process; reconnecting refreshes the list. Environment administrators can optionally set an age limit from one hour to 365 days; a background task removes older email, SMS, and webhook records in bounded batches. Cleanup is disabled by default. With shared authentication enabled, the existing instance-wide mailbox limits apply to the legacy environment only. Scoped delivery callbacks are not yet implemented.
+
+System administrators can view recent sign-ins, sign-outs, and authenticated management actions in the project workspace or through `GET /api/v1/audit`. Audit entries omit request bodies and token secrets. Recording is best effort and occurs separately from the action; failed sign-ins and individual capture requests are not currently recorded, and the log is not tamper-evident.
+
+### Test shared sign-in locally with Dex
+
+A temporary Dex identity provider can exercise shared access before an external SSO provider is available. Install Go 1.25, Docker, Node.js, and the frontend dependencies, then run:
+
+```sh
+npm ci
+bash scripts/dev-sso.sh
+```
+
+The script builds MessagePit, starts Dex 2.46.1, and prints the local UI URL and the path to a private credentials file. It creates separate administrator and developer accounts with fresh random passwords. The credentials file also contains each account's OIDC subject; use the developer's subject to add that account to a group and explicitly grant it access to a project. Dex listens on `127.0.0.1:18880` and the UI, SMTP, SendGrid, Twilio, and webhook listeners use loopback ports `18825`–`18829`. This local test permits SMTP authentication without TLS; do not expose these listeners to a network. Press Ctrl-C to stop the script, or send SIGTERM to the process ID in the printed `session.pid` file. The temporary database, credentials, and Dex container are removed when the script stops.
+
+To switch to MIM STS later, obtain its exact OIDC issuer URL, register the MessagePit callback URL with the provider, and configure the `MP_OIDC_*` values described above. User identities and project grants are keyed by issuer and subject, so grants made for the Dex test accounts do not automatically transfer to MIM identities; administrators must verify identities and assign access again.
+
+### Optional AI summaries
+
+To enable user-requested summaries, configure `MP_AI_BASE_URL` and `MP_AI_MODEL`; set `MP_AI_API_KEY` securely if the inference server requires it. The base URL can be an OpenAI-compatible API base such as `https://vllm-mimai-beta.mim.gov.sa/v1` or its `/v1/models` URL. Shared local or OIDC authentication must also be enabled. Remote endpoints require HTTPS with certificate verification; HTTP is accepted only for localhost, and redirects are refused.
+
+The project inbox shows a **Summarize with AI** action only when configured. Selecting it sends the selected email body and subject, SMS body, or webhook method, path, and body to the configured service; webhook headers and query strings are excluded. Input is limited to 16 KiB. Captured data may contain sensitive information, and generated summaries can be inaccurate. Data is not sent to AI automatically.
+
+### Groups
+
+Local administrators can create groups and manage members in the Groups page. If optional OIDC is configured, set `MP_OIDC_ADMIN_SUBJECTS` to a comma-separated subset of the allowed OIDC subject IDs to grant group administration. Other users can see only their own groups. Group membership does not grant project access.
+
 ## API
 
 The REST API is documented at [http://localhost:8025/api/v1](http://localhost:8025/api/v1).
+
+With shared authentication enabled, `GET /api/v1/me` returns the current identity, and `/api/v1/groups` provides group listing and administrator-only creation. Administrators can delete `/api/v1/groups/{id}` and add or remove members with `/api/v1/groups/{id}/members`. Group members can list their own group's members.
+
+Project metadata is available through `/api/v1/groups/{id}/projects`, and explicit viewer, developer, or administrator grants can be managed through `/api/v1/projects/{id}/members`. Project environments are available through `/api/v1/projects/{id}/environments`. Within an authorized environment, use `/api/v1/environments/{env}/messages`, `/sms`, or `/webhooks` to list records; append a record ID to inspect it. Email raw content, headers, HTML checks, and attachments are available under `/messages/{id}/raw`, `/headers`, `/html-check`, and `/part/{partID}`. Add `?query=...` to search: email supports existing search filters, SMS searches addresses and body, and webhook search includes request headers and the full body.
+
+`GET /api/v1/environments/{env}/events` upgrades to a WebSocket that sends `changed` after captures or deletions in the authorized environment. Clients fetch data separately through scoped APIs; the connection closes when access expires or is revoked.
+
+`GET /api/v1/environments/{env}/search?query=...` searches all three channels at once and returns counts plus the first 20 matches per channel. The project workspace offers the same cross-channel search under **All**, with buttons to load further matches from each channel.
+
+Developers and project administrators can delete an individual record with `DELETE /api/v1/environments/{env}/{messages|sms|webhooks}/{id}`. Administrators can set `PUT /api/v1/environments/{env}/retention` with `{"max_age_seconds":3600}` or set it to zero to disable automatic cleanup.
+
+For a test that produces several messages, include the same `X-MessagePit-Correlation-ID` header on SMTP email, SendGrid, Twilio, and webhook requests. IDs may contain up to 128 letters, digits, `.`, `_`, `-`, or `:`. `GET /api/v1/environments/{env}/correlations/{id}` returns up to 100 related record IDs and kinds from that environment, which can then be inspected through the scoped APIs.
+
+In the project workspace, select **Test run** and enter the correlation ID to see related email, SMS, and webhooks together. Select a capture to inspect it. The timeline is also available at `GET /api/v1/environments/{env}/correlations/{id}/timeline`, with zero-based `start` and a `limit` of 1–50 (20 by default). It returns capture previews and a total without the 100-record limit of the ID-only lookup. Each page reflects the current records; captures added or deleted while paging can change later pages.
+
+The included `scripts/assert-captures.sh` waits for a correlated workflow and asserts minimum capture counts, optional content expectations, and optional channel absence. It requires `curl`, `jq`, `MESSAGEPIT_URL`, `MESSAGEPIT_ENVIRONMENT_ID`, `MESSAGEPIT_CORRELATION_ID`, and a short-lived viewer or developer `MESSAGEPIT_TOKEN`:
+
+```sh
+MESSAGEPIT_EXPECT_EMAILS=1 MESSAGEPIT_EXPECT_SMS=1 MESSAGEPIT_WAIT_SECONDS=60 \
+  bash scripts/assert-captures.sh
+```
+
+Set `MESSAGEPIT_EXPECT_WEBHOOKS` to include webhook captures. The default is one email, no SMS or webhooks, and a 30-second wait. Counts are minimums: zero means no minimum, not an assertion that a channel is empty. The correlation lookup returns at most the newest 100 records, and the requested counts must total at most 100.
+
+To check that a channel has no captures for the correlation ID, set `MESSAGEPIT_EXPECT_NO_EMAILS=1`, `MESSAGEPIT_EXPECT_NO_SMS=1`, or `MESSAGEPIT_EXPECT_NO_WEBHOOKS=1`. For example, this waits five seconds for an email while checking that no SMS is captured:
+
+```sh
+MESSAGEPIT_EXPECT_EMAIL_SUBJECT='Welcome' MESSAGEPIT_EXPECT_NO_SMS=1 \
+  MESSAGEPIT_WAIT_SECONDS=5 bash scripts/assert-captures.sh
+```
+
+The helper polls approximately once per second and takes a final snapshot after the full wait. A wait of zero checks once. If an absence check reaches the 100-record correlation limit, it fails because older records might be hidden. It observes records still retained at each poll; a capture deleted between polls can be missed, so use a unique correlation ID and avoid cleanup during the test. Presence and absence cannot be required for the same channel. `MESSAGEPIT_EXPECT_NO_EMAILS=1` changes the default email minimum to zero unless an explicit minimum is supplied.
+
+Use the optional expectations below to require matching content. When several expectations are given for one channel, all must match the same record, and that channel's minimum applies to matching records. An expectation with a minimum of zero requires at least one match. Empty expectations are ignored.
+
+| Environment variable | Match |
+| --- | --- |
+| `MESSAGEPIT_EXPECT_EMAIL_SUBJECT` | Email subject contains this text. |
+| `MESSAGEPIT_EXPECT_EMAIL_BODY` | Email text or HTML body contains this text. |
+| `MESSAGEPIT_EXPECT_EMAIL_TO` | An address in the email To list matches, ignoring case. |
+| `MESSAGEPIT_EXPECT_SMS_BODY` | SMS body contains this text. |
+| `MESSAGEPIT_EXPECT_SMS_TO` | SMS recipient matches this number exactly. |
+| `MESSAGEPIT_EXPECT_WEBHOOK_METHOD` | Webhook method matches, ignoring case. |
+| `MESSAGEPIT_EXPECT_WEBHOOK_PATH` | Webhook path matches exactly. |
+| `MESSAGEPIT_EXPECT_WEBHOOK_BODY` | Webhook body contains this text. |
+
+For example:
+
+```sh
+MESSAGEPIT_EXPECT_EMAIL_SUBJECT='Welcome' MESSAGEPIT_EXPECT_EMAIL_TO='tester@example.com' \
+  MESSAGEPIT_EXPECT_SMS_BODY='verification code' MESSAGEPIT_WAIT_SECONDS=60 \
+  bash scripts/assert-captures.sh
+```
+
+Substring matching is case-sensitive. Expectations are limited to 1024 characters each. The helper prints neither captured content nor the credential. It accepts HTTPS URLs or HTTP URLs on `localhost`, `127.0.0.1`, or `[::1]`. Store the token as a masked CI variable and pass the correlation ID to the application under test.
+
+`GET` and `POST /api/v1/environments/{env}/tokens` list metadata and issue credentials; `DELETE /api/v1/environments/{env}/tokens/{id}` revokes one. For example, a project administrator can issue a one-hour developer credential with:
+
+```json
+{"name":"GitLab CI","role":"developer","ttl_seconds":3600}
+```
+
+`GET /api/v1/environments/{env}/{messages|sms}/{id}/otp` retrieves a labeled numeric verification code from an authorized email or SMS. It returns 404 when no code is found and 409 when different codes are present.
+
+For an automated test run, `GET /api/v1/environments/{env}/correlations/{id}/otp?kind=messages` or `?kind=sms` checks correlated captures in the authorized environment. Repeated occurrences of the same code are accepted; different codes return 409. A response of 404 means no matching code was found or the environment is inaccessible, and 503 means a capture could not be read and the request can be retried. The lookup returns 409 if the correlation index reaches its 100-record limit, since older records could contain a different code. Records in every channel count toward this limit. Responses are marked `no-store`.
+
+Use a unique correlation ID for each test and wait for its expected capture before retrieving the code. The lookup examines the captures available when it starts; a later capture can introduce another code. For example, in a CI job with `curl`, `jq`, and a short-lived viewer token in the masked variable `MESSAGEPIT_TOKEN`:
+
+```sh
+set -euo pipefail
+set +x
+MESSAGEPIT_EXPECT_EMAILS=0 MESSAGEPIT_EXPECT_SMS=1 \
+  MESSAGEPIT_EXPECT_SMS_BODY='verification code' bash scripts/assert-captures.sh
+api="${MESSAGEPIT_URL%/}/api/v1/environments/$MESSAGEPIT_ENVIRONMENT_ID"
+code=$(printf 'header = "Authorization: Bearer %s"\n' "$MESSAGEPIT_TOKEN" |
+  curl -q --config - --noproxy '*' --proto '=http,https' --fail --silent --show-error \
+    --max-time 10 --url "$api/correlations/$MESSAGEPIT_CORRELATION_ID/otp?kind=sms" |
+  jq -er '.code')
+```
+
+The assertion helper validates the URL and waits for a matching message. Avoid printing the token or code in CI logs. The example connects directly; deployments that require a proxy must configure a trusted proxy for their environment.
+
+`GET /api/v1/environments/{env}/{messages|sms}/{id}/simulation` returns the expected test delivery sequence, including error codes for Twilio magic-number failure scenarios. This is a simulation, and it does not send callbacks.
+
+The included GitLab pipeline builds and tests MessagePit without publishing it. Automated exchange of GitLab-issued identities for MessagePit credentials is not yet implemented; a project administrator must provision the short-lived credential for a job.
+
+The project workspace uses the Ministry of Industry and Mineral Resources logo from its [public website](https://www.mim.gov.sa/ar) and colors informed by that site. Organization-specific brand guidelines and accessibility review remain to be confirmed.
+
+### SQLite backup and restore
+
+Use a persistent `MP_DATABASE` path for data that must survive restarts. SQLite's online backup API or the `sqlite3` `.backup` command creates a consistent backup even when WAL mode is enabled:
+
+```sh
+sqlite3 /path/to/messagepit.db ".backup '/secure/backups/messagepit.db'"
+```
+
+Store the backup with restricted access: it contains captured messages, access grants, and credential hashes. To restore, stop MessagePit, place the backup at a new database path, and start MessagePit with `MP_DATABASE` pointing to that file. Browser sessions are not restored and users must sign in again.
 
 SMS endpoints:
 

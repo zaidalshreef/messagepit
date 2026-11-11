@@ -19,6 +19,7 @@ import (
 	"github.com/coreydaley/messagepit/config"
 	"github.com/coreydaley/messagepit/internal/auth"
 	"github.com/coreydaley/messagepit/internal/logger"
+	"github.com/coreydaley/messagepit/internal/oidcauth"
 	"github.com/coreydaley/messagepit/internal/pop3"
 	"github.com/coreydaley/messagepit/internal/prometheus"
 	"github.com/coreydaley/messagepit/internal/sendgrid"
@@ -39,7 +40,40 @@ import (
 var (
 	// htmlPreviewRouteRe is a regexp to match the HTML preview route
 	htmlPreviewRouteRe *regexp.Regexp
+	oidcManager        *oidcauth.Manager
 )
+
+// InitSharedAuth prepares local accounts or discovers the configured identity provider.
+func InitSharedAuth(ctx context.Context) error {
+	if !config.SharedAuthEnabled() {
+		oidcManager = nil
+		return nil
+	}
+	var manager *oidcauth.Manager
+	var err error
+	if config.LocalAuth {
+		err = storage.BootstrapLocalAdmin(ctx, config.LocalAdminUsername, config.LocalAdminPassword)
+		config.LocalAdminPassword = ""
+		if err != nil {
+			return fmt.Errorf("local account setup: set MP_LOCAL_ADMIN_PASSWORD to at least 12 characters for the first start: %w", err)
+		}
+		manager, err = oidcauth.NewLocal(config.LocalPublicURL, config.Webroot, storage.AuthenticateLocalUser, storage.LocalUserActive)
+	} else {
+		manager, err = oidcauth.New(ctx, config.OIDC)
+	}
+	if err != nil {
+		return err
+	}
+	manager.SetTokenValidator(func(ctx context.Context, value string) (oidcauth.ServicePrincipal, error) {
+		token, err := storage.AuthenticateServiceToken(ctx, value)
+		return oidcauth.ServicePrincipal{ID: token.ID, EnvironmentID: token.EnvironmentID, Role: token.Role}, err
+	})
+	manager.SetAuditHook(func(principal oidcauth.Principal, action string) {
+		writeAuditEvent(storage.AuditEvent{Issuer: principal.Issuer, Subject: principal.Subject, Action: action, Status: http.StatusOK})
+	})
+	oidcManager = manager
+	return nil
+}
 
 // skipUIAuthKey is a private context key used to signal that UI basic-auth
 // should be bypassed for a specific request. This avoids mutating the global
@@ -109,6 +143,8 @@ func Listen() {
 	r.Path(config.Webroot + "webhooks").Handler(middleWareFunc(index)).Methods("GET")
 	r.PathPrefix(config.Webroot + "webhooks/view/").Handler(middleWareFunc(index)).Methods("GET")
 	r.Path(config.Webroot + "webhooks/search").Handler(middleWareFunc(index)).Methods("GET")
+	r.Path(config.Webroot + "groups").Handler(middleWareFunc(index)).Methods("GET")
+	r.Path(config.Webroot + "projects").Handler(middleWareFunc(index)).Methods("GET")
 	r.Path(config.Webroot).Handler(middleWareFunc(index)).Methods("GET")
 
 	if auth.UICredentials != nil {
@@ -118,11 +154,15 @@ func Listen() {
 	// Mark the application here as ready
 	isReady.Store(true)
 
+	var handler http.Handler = r
+	if oidcManager != nil {
+		handler = oidcManager.Wrap(handler)
+	}
 	server := &http.Server{
 		Addr:         config.HTTPListen,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
-		Handler:      r,
+		Handler:      handler,
 	}
 
 	// add temporary self-signed certificates to get deleted afterwards
@@ -257,6 +297,38 @@ func apiRoutes() *mux.Router {
 	r := mux.NewRouter()
 
 	// API V1
+	r.HandleFunc(config.Webroot+"api/v1/me", middleWareFunc(apiv1.CurrentUser)).Methods("GET")
+	r.HandleFunc(config.Webroot+"api/v1/local-users", middleWareFunc(auditMutation("local_users", apiv1.LocalUsers))).Methods("GET", "POST")
+	r.HandleFunc(config.Webroot+"api/v1/local-users/{username}", middleWareFunc(auditMutation("local_user", apiv1.DisableLocalUser))).Methods("DELETE")
+	r.HandleFunc(config.Webroot+"api/v1/local-users/{username}/password", middleWareFunc(auditMutation("local_user_password", apiv1.ResetLocalPassword))).Methods("POST")
+	r.HandleFunc(config.Webroot+"api/v1/local-password", middleWareFunc(auditMutation("local_password", apiv1.LocalPassword))).Methods("POST")
+	r.HandleFunc(config.Webroot+"api/v1/groups", middleWareFunc(auditMutation("groups", apiv1.Groups))).Methods("GET", "POST")
+	r.HandleFunc(config.Webroot+"api/v1/groups/{id}", middleWareFunc(auditMutation("group", apiv1.DeleteGroup))).Methods("DELETE")
+	r.HandleFunc(config.Webroot+"api/v1/groups/{id}/members", middleWareFunc(auditMutation("group.members", apiv1.GroupMembers))).Methods("GET", "POST", "DELETE")
+	r.HandleFunc(config.Webroot+"api/v1/groups/{id}/projects", middleWareFunc(auditMutation("group.projects", apiv1.GroupProjects))).Methods("GET", "POST")
+	r.HandleFunc(config.Webroot+"api/v1/projects/{id}", middleWareFunc(apiv1.ProjectDetails)).Methods("GET")
+	r.HandleFunc(config.Webroot+"api/v1/projects/{id}/environments", middleWareFunc(auditMutation("project.environments", apiv1.ProjectEnvironments))).Methods("GET", "POST")
+	r.HandleFunc(config.Webroot+"api/v1/projects/{id}/members", middleWareFunc(auditMutation("project.members", apiv1.ProjectMembers))).Methods("GET", "POST", "DELETE")
+	r.HandleFunc(config.Webroot+"api/v1/environments/{env}/{kind:messages|sms|webhooks}", middleWareFunc(apiv1.EnvironmentMessages)).Methods("GET")
+	r.HandleFunc(config.Webroot+"api/v1/environments/{env}/{kind:messages|sms|webhooks}/{record}", middleWareFunc(apiv1.EnvironmentMessage)).Methods("GET")
+	r.HandleFunc(config.Webroot+"api/v1/environments/{env}/{kind:messages|sms|webhooks}/{record}", middleWareFunc(auditMutation("environment.record", apiv1.DeleteEnvironmentMessage))).Methods("DELETE")
+	r.HandleFunc(config.Webroot+"api/v1/environments/{env}/{kind:messages|sms}/{record}/otp", middleWareFunc(apiv1.EnvironmentVerificationCode)).Methods("GET")
+	r.HandleFunc(config.Webroot+"api/v1/environments/{env}/{kind:messages|sms}/{record}/simulation", middleWareFunc(apiv1.EnvironmentSimulation)).Methods("GET")
+	r.HandleFunc(config.Webroot+"api/v1/environments/{env}/tokens", middleWareFunc(auditMutation("environment.tokens", apiv1.EnvironmentTokens))).Methods("GET", "POST")
+	r.HandleFunc(config.Webroot+"api/v1/environments/{env}/tokens/{token}", middleWareFunc(auditMutation("environment.token", apiv1.RevokeEnvironmentToken))).Methods("DELETE")
+	r.HandleFunc(config.Webroot+"api/v1/environments/{env}/ai", middleWareFunc(apiv1.EnvironmentAIStatus)).Methods("GET")
+	r.HandleFunc(config.Webroot+"api/v1/environments/{env}/retention", middleWareFunc(auditMutation("environment.retention", apiv1.EnvironmentRetention))).Methods("GET", "PUT")
+	r.HandleFunc(config.Webroot+"api/v1/environments/{env}/correlations/{correlation}", middleWareFunc(apiv1.EnvironmentCorrelation)).Methods("GET")
+	r.HandleFunc(config.Webroot+"api/v1/environments/{env}/correlations/{correlation}/timeline", middleWareFunc(apiv1.EnvironmentCorrelationTimeline)).Methods("GET")
+	r.HandleFunc(config.Webroot+"api/v1/environments/{env}/correlations/{correlation}/otp", middleWareFunc(apiv1.EnvironmentCorrelationCode)).Methods("GET")
+	r.HandleFunc(config.Webroot+"api/v1/environments/{env}/search", middleWareFunc(apiv1.EnvironmentSearch)).Methods("GET")
+	r.HandleFunc(config.Webroot+"api/v1/environments/{env}/events", middleWareFunc(apiv1.EnvironmentEvents)).Methods("GET")
+	r.HandleFunc(config.Webroot+"api/v1/environments/{env}/{kind:messages|sms|webhooks}/{record}/summary", middleWareFunc(auditMutation("environment.ai_summary", apiv1.EnvironmentSummary))).Methods("POST")
+	r.HandleFunc(config.Webroot+"api/v1/audit", middleWareFunc(apiv1.AuditEvents)).Methods("GET")
+	r.HandleFunc(config.Webroot+"api/v1/environments/{env}/{kind:messages}/{record}/raw", middleWareFunc(apiv1.EnvironmentMessageRaw)).Methods("GET")
+	r.HandleFunc(config.Webroot+"api/v1/environments/{env}/{kind:messages}/{record}/headers", middleWareFunc(apiv1.EnvironmentMessageHeaders)).Methods("GET")
+	r.HandleFunc(config.Webroot+"api/v1/environments/{env}/{kind:messages}/{record}/html-check", middleWareFunc(apiv1.EnvironmentHTMLCheck)).Methods("GET")
+	r.HandleFunc(config.Webroot+"api/v1/environments/{env}/{kind:messages}/{record}/part/{partID}", middleWareFunc(apiv1.EnvironmentAttachment)).Methods("GET")
 	r.HandleFunc(config.Webroot+"api/v1/messages", middleWareFunc(apiv1.GetMessages)).Methods("GET")
 	r.HandleFunc(config.Webroot+"api/v1/messages", middleWareFunc(apiv1.SetReadStatus)).Methods("PUT")
 	r.HandleFunc(config.Webroot+"api/v1/messages", middleWareFunc(apiv1.DeleteMessages)).Methods("DELETE")
@@ -451,7 +523,7 @@ func addSlashToWebroot(w http.ResponseWriter, r *http.Request) {
 // Websocket to broadcast changes.
 // Authentication and CORS are handled by middleWareFunc before this is reached.
 func apiWebsocket(w http.ResponseWriter, r *http.Request) {
-	websockets.ServeWs(websockets.MessageHub, w, r)
+	websockets.ServeWs(websockets.MessageHub, w, r, oidcauth.Lifetime(r.Context()))
 	storage.BroadcastMailboxStats()
 }
 
@@ -490,7 +562,7 @@ func index(w http.ResponseWriter, r *http.Request) {
 </head>
 
 <body class="h-100">
-	<div class="container-fluid h-100 d-flex flex-column" id="app" data-webroot="{{ .Webroot }}" data-version="{{ .Version }}">
+	<div class="container-fluid h-100 d-flex flex-column" id="app" data-webroot="{{ .Webroot }}" data-version="{{ .Version }}" data-oidc="{{ .OIDCEnabled }}" data-mailbox-access="{{ .MailboxAccess }}">
 		<noscript class="alert alert-warning position-absolute top-50 start-50 translate-middle">
 			You need a browser with JavaScript enabled to use MessagePit
 		</noscript>
@@ -507,13 +579,20 @@ func index(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := struct {
-		Webroot string
-		Version string
-		Nonce   string
+		Webroot       string
+		Version       string
+		Nonce         string
+		OIDCEnabled   bool
+		MailboxAccess bool
 	}{
-		Webroot: config.Webroot,
-		Version: config.Version,
-		Nonce:   r.Header.Get("mp-nonce"),
+		Webroot:       config.Webroot,
+		Version:       config.Version,
+		Nonce:         r.Header.Get("mp-nonce"),
+		OIDCEnabled:   oidcManager != nil,
+		MailboxAccess: oidcManager == nil,
+	}
+	if principal, ok := oidcauth.CurrentPrincipal(r.Context()); ok {
+		data.MailboxAccess = principal.Admin
 	}
 
 	buff := new(bytes.Buffer)

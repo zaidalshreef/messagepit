@@ -7,6 +7,8 @@ require (
 	github.com/araddon/dateparse v0.0.0-20210429162001-6b43995a97de
 	github.com/axllent/ghru/v2 v2.2.3
 	github.com/axllent/semver v1.0.0
+	github.com/coreos/go-oidc/v3 v3.21.0
+	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/goccy/go-yaml v1.19.2
 	github.com/gomarkdown/markdown v0.0.0-20260412113850-134a5b2cce7f
 	github.com/gorilla/mux v1.8.1
@@ -27,6 +29,7 @@ require (
 	github.com/vanng822/go-premailer v1.33.0
 	golang.org/x/crypto v0.50.0
 	golang.org/x/net v0.53.0
+	golang.org/x/oauth2 v0.36.0
 	golang.org/x/text v0.36.0
 	golang.org/x/time v0.15.0
 	modernc.org/sqlite v1.48.2

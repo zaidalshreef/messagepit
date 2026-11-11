@@ -438,8 +438,16 @@ pre[class*="language-"] {
 // ── MessagePit Design System ──────────────────────────────────────────────────
 
 :root {
-	--mp-accent: #2c3e50;
-	--mp-accent-subtle: rgba(44, 62, 80, 0.12);
+	--mp-accent: #25935f;
+	--mp-accent-subtle: rgba(37, 147, 95, 0.12);
+}
+
+.mim-logo {
+	background: #fff;
+	border-radius: 0.4rem;
+	padding: 0.35rem;
+	height: auto;
+	max-width: 100%;
 }
 
 // Unread indicator — amber left border across all list views

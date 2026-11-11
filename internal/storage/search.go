@@ -21,6 +21,18 @@ import (
 // is:read, is:unread, has:attachment, to:<term>, from:<term> & subject:<term>
 // Negative searches also also included by prefixing the search term with a `-` or `!`
 func Search(search, timezone string, start int, beforeTS int64, limit int) ([]MessageSummary, int, error) {
+	return searchMessages("", search, timezone, start, beforeTS, limit)
+}
+
+// SearchEnvironmentMessages searches email within one environment.
+func SearchEnvironmentMessages(environmentID, search, timezone string, start int, beforeTS int64, limit int) ([]MessageSummary, int, error) {
+	if environmentID == "" {
+		return nil, 0, ErrEnvironmentNotFound
+	}
+	return searchMessages(environmentID, search, timezone, start, beforeTS, limit)
+}
+
+func searchMessages(environmentID, search, timezone string, start int, beforeTS int64, limit int) ([]MessageSummary, int, error) {
 	results := []MessageSummary{}
 	allResults := []MessageSummary{}
 	tsStart := time.Now()
@@ -33,6 +45,13 @@ func Search(search, timezone string, start int, beforeTS int64, limit int) ([]Me
 
 	if beforeTS > 0 {
 		q = q.Where(`Created < ?`, beforeTS)
+	}
+	if environmentID != "" {
+		q = q.Where(ownershipPredicate("m.ID"), "email", LegacyEnvironmentID, environmentID)
+		if err := db.QueryRowContext(context.TODO(), `SELECT COUNT(*) FROM (`+q.String()+`)`, q.Args()...).Scan(&nrResults); err != nil {
+			return results, 0, err
+		}
+		q = q.Limit(limit).Offset(start)
 	}
 
 	var err error
@@ -74,14 +93,16 @@ func Search(search, timezone string, start int, beforeTS int64, limit int) ([]Me
 		return results, nrResults, err
 	}
 
-	dbLastAction = time.Now()
+	markDatabaseAction()
 
-	nrResults = len(allResults)
-
-	if nrResults > start {
-		end := min(nrResults, start+limit)
-
-		results = allResults[start:end]
+	if environmentID != "" {
+		results = allResults
+	} else {
+		nrResults = len(allResults)
+		if nrResults > start {
+			end := min(nrResults, start+limit)
+			results = allResults[start:end]
+		}
 	}
 
 	// set tags for listed messages only
@@ -91,7 +112,11 @@ func Search(search, timezone string, start int, beforeTS int64, limit int) ([]Me
 
 	elapsed := time.Since(tsStart)
 
-	logger.Log().Debugf("[db] search for \"%s\" in %s", search, elapsed)
+	if environmentID != "" {
+		logger.Log().Debugf("[db] environment search completed in %s", elapsed)
+	} else {
+		logger.Log().Debugf("[db] search for \"%s\" in %s", search, elapsed)
+	}
 
 	return results, nrResults, err
 }
@@ -120,7 +145,7 @@ func SearchUnreadCount(search, timezone string, beforeTS int64) (int64, error) {
 
 	})
 
-	dbLastAction = time.Now()
+	markDatabaseAction()
 
 	elapsed := time.Since(tsStart)
 
@@ -229,7 +254,7 @@ func DeleteSearch(search, timezone string) error {
 
 		logger.Log().Debugf("[db] deleted %d messages matching %s", total, search)
 
-		dbLastAction = time.Now()
+		markDatabaseAction()
 
 		// broadcast changes
 		if len(ids) > 200 {

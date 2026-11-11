@@ -15,6 +15,19 @@ Notable MessagePit changes are listed here. Changes inherited from Mailpit upstr
 - **`MP_SMS_WEBHOOK_URL` renamed to `MP_TWILIO_WEBHOOK_URL`** — MessagePit exits non-zero if the old env var is detected
 
 #### Feature
+- Search a test run's correlated email, SMS, and webhooks together in a paginated project timeline
+- Add local username/password sign-in and administrator-managed accounts for shared projects
+- Retrieve an unambiguous email or SMS verification code for a correlated test run
+- Add optional OIDC sign-in, groups, explicit project roles, and environment-scoped service credentials for shared sandboxes
+- Capture SMTP, SendGrid, Twilio SMS, and webhooks into authorized environments, with scoped inspection and search
+- Add a project workspace with MIM-inspired styling and a GitLab CI build and test pipeline
+- Add scoped verification-code extraction and optional, explicitly requested AI summaries for QA
+- Add scoped deletion and opt-in per-environment retention for email, SMS, and webhooks
+- Record session and authenticated management events for system administrators
+- Correlate SMTP, SendGrid, SMS, and webhook captures by an environment-scoped test ID
+- Add a CI helper to assert correlated capture counts, content, and channel absence
+- Expose scoped email headers and HTML compatibility checks in the project workspace
+- Show simulated email and SMS delivery sequences, including SMS failure scenarios
 - **Twilio SMS status progression** — status callbacks now replay `queued` → `sent` → `delivered` (one signed POST per state change) instead of a single `delivered` callback. Bodies carry the full Twilio field set: `MessageSid`/`SmsSid`, `MessageStatus`/`SmsStatus`, `To`, `From`, `AccountSid`, `ApiVersion`, plus `ErrorCode`/`ErrorMessage` on failures
 - Honour Twilio's reserved magic test numbers (`+15005550001`–`+15005550009`) with the real API error codes (21211, 21212, 21408, 21606, 21610, 21611, 21612, 21614); rejected messages are neither stored nor announced by callback
 - Add MessagePit magic numbers `+15005550010`–`+15005550014` for the delivery-failure branches: `failed` (30008), `undelivered` (30003 / 30005 / 30006), and a progression that stalls at `sent`
@@ -25,20 +38,28 @@ Notable MessagePit changes are listed here. Changes inherited from Mailpit upstr
 - Flatten every `custom_args` key onto each event as a top-level field, matching real SendGrid (previously only `notification_id` was carried)
 - Carry categories and custom args through storage on SendGrid's own `X-SMTPAPI` header, so SMTP-delivered mail can supply them too
 - Add `--email-webhook-event-delay` / `MP_EMAIL_WEBHOOK_EVENT_DELAY` to space out the event lifecycle
-- Add Mailtrap Email Sending API stub (`POST /api/send`, port 8027) — point Mailtrap SDK clients at `http://localhost:8027` for local development
-- Add `--mailtrap` flag and `MP_MAILTRAP_BIND_ADDR` env var to configure the Mailtrap listener address (defaults to `127.0.0.1:8027`)
-- Add `--mailtrap-api-key` flag and `MP_MAILTRAP_API_KEY` env var for Bearer token authentication on the Mailtrap stub
 
 #### Change
+- Keep shared navigation usable at narrow screen widths
+- Preserve SendGrid display names containing punctuation when formatting email addresses
+- Preserve supplied SendGrid MIME content-type parameters without duplicating the charset
+- Remove the Mailtrap sending API stub; the SendGrid listener remains available on port 8100
 - The email event webhook now fires for **every** captured message, not only those carrying a `notification_id` custom arg — matching real SendGrid, which fires for everything it accepts over both the v3 API and its SMTP relay. Handlers that assumed a `notification_id` was always present must guard for its absence
 
 #### Security
+- Apply internal network restrictions to HTML stylesheet checks, and keep inspection URLs out of server logs
+- Validate SendGrid recipients, custom headers, and MIME content types before storing messages
+- Avoid logging POP3 authentication arguments or usernames, including malformed commands
+- Redact SMTP authentication data even when a command is malformed
+- Use constant-time comparison for standalone Twilio authentication tokens
+- Remove authorization headers from shared webhook captures regardless of header casing
+- Keep callback URLs, credentials, and recipients out of callback error logs
+- Prevent the CI assertion helper from sending scoped credentials over insecure remote HTTP
 - Sanitize CR/LF in the `notification_id` and `mp_scenario` custom args before writing them as MIME headers
-- Add 10 MiB body-size cap to Mailtrap and SendGrid handlers (prevents request body DoS)
-- Use constant-time comparison for Bearer token validation in Mailtrap and SendGrid handlers
-- Validate all email addresses in Mailtrap handler; validate `from` address in SendGrid handler
-- Sanitize CR/LF in custom header values (Mailtrap and SendGrid) to prevent header injection
-- Drop reserved MIME headers (Content-Type, From, To, Cc, Bcc, Subject, Date, MIME-Version) from user-supplied Mailtrap `headers` map
+- Add a 10 MiB body-size cap to the SendGrid handler (prevents request body DoS)
+- Use constant-time comparison for SendGrid Bearer token validation
+- Validate the SendGrid sender address
+- Sanitize CR/LF in SendGrid custom header values to prevent header injection
 
 ### [MessagePit v1.2.1]
 

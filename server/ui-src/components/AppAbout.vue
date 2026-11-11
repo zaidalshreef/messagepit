@@ -6,6 +6,18 @@ import { mailbox } from "../stores/mailbox";
 import { useCommon } from "../composables/useCommon";
 
 const { loading, get, resolve, getFileSize, secondsToRelative, modal } = useCommon();
+const oidcEnabled = document.getElementById("app")?.dataset.oidc === "true";
+const mailboxAccess = document.getElementById("app")?.dataset.mailboxAccess !== "false";
+
+async function signOut() {
+	try {
+		const response = await fetch(resolve("/auth/logout"), { method: "POST", credentials: "same-origin" });
+		if (!response.ok) throw new Error("Unable to sign out");
+		window.location.assign(resolve("/auth/signed-out"));
+	} catch (error) {
+		alert(error.message);
+	}
+}
 
 defineProps({
 	modals: {
@@ -47,10 +59,19 @@ function requestNotifications() {
 
 <template>
 	<template v-if="navbar">
-		<button class="btn btn-sm text-white opacity-75 px-2" title="About MessagePit" @click="loadInfo()">
+		<button v-if="oidcEnabled" class="btn btn-sm text-white px-2" title="Sign out" @click="signOut()">
+			Sign out
+		</button>
+		<button
+			v-if="mailboxAccess"
+			class="btn btn-sm text-white opacity-75 px-2"
+			title="About MessagePit"
+			@click="loadInfo()"
+		>
 			<i class="bi bi-info-circle-fill"></i>
 		</button>
 		<RouterLink
+			v-if="mailboxAccess"
 			:to="resolve('/api/v1/')"
 			target="_blank"
 			class="btn btn-sm text-white opacity-75 px-2 no-icon"
@@ -59,7 +80,7 @@ function requestNotifications() {
 			<i class="bi bi-book"></i>
 		</RouterLink>
 		<button
-			v-if="mailbox.connected && mailbox.notificationsSupported && !mailbox.notificationsEnabled"
+			v-if="mailboxAccess && mailbox.connected && mailbox.notificationsSupported && !mailbox.notificationsEnabled"
 			class="btn btn-sm text-white opacity-75 px-2"
 			data-bs-toggle="modal"
 			data-bs-target="#EnableNotificationsModal"
@@ -68,6 +89,7 @@ function requestNotifications() {
 			<i class="bi bi-bell"></i>
 		</button>
 		<button
+			v-if="mailboxAccess"
 			class="btn btn-sm text-white opacity-75 px-2"
 			data-bs-toggle="modal"
 			data-bs-target="#SettingsModal"

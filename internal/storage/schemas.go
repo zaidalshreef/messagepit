@@ -101,6 +101,14 @@ func dbApplySchemas() error {
 	})
 
 	for _, s := range scripts {
+		if sqlDriver == "rqlite" {
+			// Shared mode requires transactional SQLite. These schemas are not
+			// needed by the standalone rqlite workflow.
+			switch s.Semver {
+			case "4.0.0", "4.1.0", "4.2.0", "4.3.0", "4.4.0", "4.5.0", "4.6.0", "4.7.0", "4.8.0":
+				continue
+			}
+		}
 		var complete int
 		err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM `+tenant("schemas")+` WHERE Version = ?)`, s.Semver).Scan(&complete)
 		if err != nil {

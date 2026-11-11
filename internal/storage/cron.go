@@ -14,7 +14,7 @@ import (
 )
 
 // Database cron runs every minute
-func dbCron() {
+func dbCron(ctx context.Context) {
 	if config.DisableAutoVACUUM {
 		if sqlDriver == "rqlite" {
 			logger.Log().Warn("[db] disable-auto-vacuum has no effect as rqlite handles vacuuming automatically")
@@ -23,11 +23,17 @@ func dbCron() {
 		}
 	}
 
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
 	for {
-		time.Sleep(60 * time.Second)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 
 		currentTime := time.Now()
-		sinceLastDbAction := currentTime.Sub(dbLastAction)
+		sinceLastDbAction := currentTime.Sub(time.Unix(0, dbLastAction.Load()))
 
 		// only run the database has been idle for 5 minutes
 		if math.Floor(sinceLastDbAction.Minutes()) == 5 {
@@ -50,6 +56,11 @@ func dbCron() {
 		}
 
 		pruneMessages()
+		if config.SharedAuthEnabled() {
+			if err := PruneEnvironmentRecords(ctx, currentTime); err != nil {
+				logger.Log().Errorf("[db] environment retention failed: %s", err)
+			}
+		}
 	}
 }
 
@@ -72,11 +83,14 @@ func pruneMessages() {
 		if config.DemoMode {
 			offset = 500
 		}
-		q := sqlf.Select("ID, Size").
-			From(tenant("mailbox")).
+		q := sqlf.Select("m.ID, m.Size").
+			From(tenant("mailbox") + " m").
 			OrderBy("Created DESC").
 			Limit(5000).
 			Offset(offset)
+		if config.SharedAuthEnabled() {
+			q = q.Where(ownershipPredicate("m.ID"), "email", LegacyEnvironmentID, LegacyEnvironmentID)
+		}
 
 		if err := q.QueryAndClose(
 			context.TODO(), db, func(row *sql.Rows) {
@@ -101,10 +115,13 @@ func pruneMessages() {
 		// now() minus the number of hours
 		ts := time.Now().Add(time.Duration(-config.MaxAgeInHours) * time.Hour).UnixMilli()
 
-		q := sqlf.Select("ID, Size").
-			From(tenant("mailbox")).
+		q := sqlf.Select("m.ID, m.Size").
+			From(tenant("mailbox")+" m").
 			Where("Created < ?", ts).
 			Limit(5000)
+		if config.SharedAuthEnabled() {
+			q = q.Where(ownershipPredicate("m.ID"), "email", LegacyEnvironmentID, LegacyEnvironmentID)
+		}
 
 		if err := q.QueryAndClose(context.TODO(), db, func(row *sql.Rows) {
 			var id string
@@ -170,7 +187,7 @@ func pruneMessages() {
 	}
 
 	addDeletedSize(prunedSize)
-	dbLastAction = time.Now()
+	markDatabaseAction()
 
 	elapsed := time.Since(start)
 	logger.Log().Debugf("[db] auto-pruned %d messages in %s", len(ids), elapsed)

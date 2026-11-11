@@ -18,8 +18,10 @@ import (
 	"time"
 
 	"github.com/axllent/ghru/v2"
+	"github.com/coreydaley/messagepit/internal/ai"
 	"github.com/coreydaley/messagepit/internal/auth"
 	"github.com/coreydaley/messagepit/internal/logger"
+	"github.com/coreydaley/messagepit/internal/oidcauth"
 	"github.com/coreydaley/messagepit/internal/smtpd/chaos"
 	"github.com/coreydaley/messagepit/internal/snakeoil"
 	"github.com/coreydaley/messagepit/internal/spamassassin"
@@ -54,6 +56,9 @@ var (
 
 	// Database for mail (optional)
 	Database string
+
+	// AI configures optional, user-requested summaries of captured data.
+	AI ai.Config
 
 	// DisableWAL will disable Write-Ahead Logging in SQLite
 	// @see https://sqlite.org/wal.html
@@ -96,6 +101,15 @@ var (
 
 	// UIAuthFile for UI & API authentication
 	UIAuthFile string
+
+	// OIDC configures optional single sign-on for the UI and management API.
+	OIDC oidcauth.Config
+
+	// LocalAuth enables shared access with locally managed username/password accounts.
+	LocalAuth          bool
+	LocalPublicURL     = "http://127.0.0.1:8025"
+	LocalAdminUsername = "admin"
+	LocalAdminPassword string
 
 	// Webroot to define the base path for the UI and API
 	Webroot = "/"
@@ -145,7 +159,7 @@ var (
 	BlockRemoteCSSAndFonts = false
 
 	// AllowInternalHTTPRequests will allow HTTP requests to internal IP addresses (e.g., loopback, private, link-local, or multicast) when set to true.
-	// This policy applies to both link checking and screenshot generation (proxy) features and is disabled by default for security reasons.
+	// This policy applies to HTML and link checking and screenshot generation (proxy), and is disabled by default.
 	AllowInternalHTTPRequests = false
 
 	// CLITagsArg is used to map the CLI args
@@ -418,7 +432,7 @@ func VerifyConfig() error {
 		}
 
 		if err := auth.SetUIAuth(string(b)); err != nil {
-			return err
+			return fmt.Errorf("[ui] invalid HTTP password file %s: %w", UIAuthFile, err)
 		}
 	}
 
@@ -464,7 +478,7 @@ func VerifyConfig() error {
 		}
 
 		if err := auth.SetSendAPIAuth(string(b)); err != nil {
-			return err
+			return fmt.Errorf("[send-api] invalid password file %s: %w", SendAPIAuthFile, err)
 		}
 
 		logger.Log().Info("[send-api] enabling basic authentication")
@@ -544,7 +558,7 @@ func VerifyConfig() error {
 		}
 
 		if err := auth.SetSMTPAuth(string(b)); err != nil {
-			return err
+			return fmt.Errorf("[smtp] invalid password file %s: %w", SMTPAuthFile, err)
 		}
 
 		if !SMTPAuthAllowInsecure {
@@ -621,7 +635,7 @@ func VerifyConfig() error {
 		}
 
 		if err := auth.SetPOP3Auth(string(b)); err != nil {
-			return err
+			return fmt.Errorf("[pop3] invalid password file %s: %w", POP3AuthFile, err)
 		}
 	}
 
@@ -633,6 +647,36 @@ func VerifyConfig() error {
 
 	s := strings.TrimRight(path.Join("/", Webroot, "/"), "/") + "/"
 	Webroot = s
+	OIDC.Webroot = Webroot
+	if err := OIDC.Validate(); err != nil {
+		return err
+	}
+	if LocalAuth && OIDC.Enabled() {
+		return errors.New("local authentication cannot be combined with OIDC")
+	}
+	if !LocalAuth && LocalAdminPassword != "" {
+		return errors.New("MP_LOCAL_ADMIN_PASSWORD requires local authentication")
+	}
+	if LocalAuth {
+		if err := oidcauth.ValidateLocalConfig(LocalPublicURL, Webroot); err != nil {
+			return err
+		}
+	}
+	if SharedAuthEnabled() && (auth.UICredentials != nil || auth.SendAPICredentials != nil || SendAPIAuthAcceptAny) {
+		return errors.New("shared authentication cannot be combined with UI or send API basic authentication")
+	}
+	if SharedAuthEnabled() && (auth.SMTPCredentials != nil || SMTPAuthAcceptAny || auth.POP3Credentials != nil) {
+		return errors.New("shared authentication cannot be combined with SMTP or POP3 password authentication")
+	}
+	if err := VerifySharedDatabase(); err != nil {
+		return err
+	}
+	if err := AI.Validate(); err != nil {
+		return err
+	}
+	if AI.Enabled() && !SharedAuthEnabled() {
+		return errors.New("AI summaries require shared authentication and project access controls")
+	}
 
 	if WebhookURL != "" && !isValidURL(WebhookURL) {
 		return fmt.Errorf("webhook URL does not appear to be a valid URL (%s)", WebhookURL)
@@ -771,5 +815,18 @@ func VerifyConfig() error {
 		logger.Log().Info("demo mode enabled")
 	}
 
+	return nil
+}
+
+// SharedAuthEnabled reports whether the isolated shared platform is active.
+func SharedAuthEnabled() bool {
+	return LocalAuth || OIDC.Enabled()
+}
+
+// VerifySharedDatabase requires real transactions for project isolation.
+func VerifySharedDatabase() error {
+	if SharedAuthEnabled() && (strings.HasPrefix(Database, "http://") || strings.HasPrefix(Database, "https://")) {
+		return errors.New("shared project isolation requires SQLite; the rqlite driver does not provide transactions")
+	}
 	return nil
 }

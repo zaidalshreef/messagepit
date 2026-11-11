@@ -14,15 +14,30 @@ import (
 // SearchSMS returns SMS messages matching query across From, To, and Body fields.
 // Returns the matching page and total match count.
 func SearchSMS(query string, start, limit int) ([]SMSMessageSummary, int, error) {
+	return searchSMS("", query, start, limit)
+}
+
+// SearchEnvironmentSMS searches SMS within one environment.
+func SearchEnvironmentSMS(environmentID, query string, start, limit int) ([]SMSMessageSummary, int, error) {
+	if environmentID == "" {
+		return nil, 0, ErrEnvironmentNotFound
+	}
+	return searchSMS(environmentID, query, start, limit)
+}
+
+func searchSMS(environmentID, query string, start, limit int) ([]SMSMessageSummary, int, error) {
 	like := "%" + query + "%"
 	results := []SMSMessageSummary{}
 
-	q := sqlf.From(tenant("sms_mailbox")).
+	q := sqlf.From(tenant("sms_mailbox")+" m").
 		Select(`ID, FromNumber, ToNumber, Body, Read, Created`).
 		Where(`(FromNumber LIKE ? OR ToNumber LIKE ? OR Body LIKE ?)`, like, like, like).
 		OrderBy("Created DESC").
 		Limit(limit).
 		Offset(start)
+	if environmentID != "" {
+		q = q.Where(ownershipPredicate("m.ID"), "sms", LegacyEnvironmentID, environmentID)
+	}
 
 	if err := q.QueryAndClose(context.TODO(), db, func(row *sql.Rows) {
 		var msg SMSMessageSummary
@@ -40,10 +55,13 @@ func SearchSMS(query string, start, limit int) ([]SMSMessageSummary, int, error)
 	}
 
 	var count int
-	if err := db.QueryRow( // #nosec
-		fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE (FromNumber LIKE ? OR ToNumber LIKE ? OR Body LIKE ?)`, tenant("sms_mailbox")),
-		like, like, like,
-	).Scan(&count); err != nil {
+	countQuery := fmt.Sprintf(`SELECT COUNT(*) FROM %s m WHERE (FromNumber LIKE ? OR ToNumber LIKE ? OR Body LIKE ?)`, tenant("sms_mailbox"))
+	args := []any{like, like, like}
+	if environmentID != "" {
+		countQuery += ` AND ` + ownershipPredicate("m.ID")
+		args = append(args, "sms", LegacyEnvironmentID, environmentID)
+	}
+	if err := db.QueryRow(countQuery, args...).Scan(&count); err != nil { // #nosec
 		return results, 0, err
 	}
 
@@ -53,18 +71,33 @@ func SearchSMS(query string, start, limit int) ([]SMSMessageSummary, int, error)
 // StoreSMS saves an inbound SMS message to the database.
 // Returns the database ID of the saved message.
 func StoreSMS(from, to, body, accountSID string) (string, error) {
+	return storeSMS(context.Background(), "", "", from, to, body, accountSID)
+}
+
+// StoreSMSInEnvironment atomically saves an SMS and its environment ownership.
+func StoreSMSInEnvironment(ctx context.Context, environmentID, from, to, body, accountSID, correlationID string) (string, error) {
+	if environmentID == "" {
+		return "", ErrEnvironmentNotFound
+	}
+	return storeSMS(ctx, environmentID, correlationID, from, to, body, accountSID)
+}
+
+func storeSMS(ctx context.Context, environmentID, correlationID, from, to, body, accountSID string) (string, error) {
 	id := shortuuid.New()
 	created := time.Now()
 
-	_, err := db.Exec(
-		fmt.Sprintf( // #nosec
+	err := saveRecord(ctx, environmentID, "sms", id, correlationID, func(execer recordExecer) error {
+		_, err := execer.ExecContext(ctx, fmt.Sprintf( // #nosec
 			`INSERT INTO %s (ID, FromNumber, ToNumber, Body, AccountSID, Read, Created) VALUES (?, ?, ?, ?, ?, 0, ?)`,
 			tenant("sms_mailbox"),
-		),
-		id, from, to, body, accountSID, created.UnixMilli(),
-	)
+		), id, from, to, body, accountSID, created.UnixMilli())
+		return err
+	})
 	if err != nil {
 		return "", err
+	}
+	if environmentID != "" {
+		return id, nil
 	}
 
 	c := &SMSMessageSummary{
@@ -79,7 +112,7 @@ func StoreSMS(from, to, body, accountSID string) (string, error) {
 	broadcast("sms", c)
 	sendWebhook(c)
 
-	dbLastAction = time.Now()
+	markDatabaseAction()
 
 	logger.Log().Debugf("[db] saved SMS %s from %s", id, from)
 
@@ -88,13 +121,28 @@ func StoreSMS(from, to, body, accountSID string) (string, error) {
 
 // ListSMS returns a subset of SMS messages, sorted latest to oldest.
 func ListSMS(start, limit int) ([]SMSMessageSummary, error) {
+	return listSMS("", start, limit)
+}
+
+// ListEnvironmentSMS returns SMS messages belonging to one environment.
+func ListEnvironmentSMS(environmentID string, start, limit int) ([]SMSMessageSummary, error) {
+	if environmentID == "" {
+		return nil, ErrEnvironmentNotFound
+	}
+	return listSMS(environmentID, start, limit)
+}
+
+func listSMS(environmentID string, start, limit int) ([]SMSMessageSummary, error) {
 	results := []SMSMessageSummary{}
 
-	q := sqlf.From(tenant("sms_mailbox")).
-		Select(`ID, FromNumber, ToNumber, Body, Read, Created`).
-		OrderBy("Created DESC").
+	q := sqlf.From(tenant("sms_mailbox") + " m").
+		Select(`m.ID, m.FromNumber, m.ToNumber, m.Body, m.Read, m.Created`).
+		OrderBy("m.Created DESC").
 		Limit(limit).
 		Offset(start)
+	if environmentID != "" {
+		q = q.Where(ownershipPredicate("m.ID"), "sms", LegacyEnvironmentID, environmentID)
+	}
 
 	if err := q.QueryAndClose(context.TODO(), db, func(row *sql.Rows) {
 		var msg SMSMessageSummary
@@ -167,7 +215,7 @@ func DeleteSMS(id string) error {
 	}
 
 	broadcast("sms_delete", id)
-	dbLastAction = time.Now()
+	markDatabaseAction()
 
 	return nil
 }
@@ -180,7 +228,7 @@ func DeleteAllSMS() error {
 	}
 
 	broadcast("sms_truncate", nil)
-	dbLastAction = time.Now()
+	markDatabaseAction()
 
 	return nil
 }
